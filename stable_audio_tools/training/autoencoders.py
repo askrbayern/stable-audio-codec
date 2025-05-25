@@ -45,7 +45,12 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
             force_input_mono = False,
             latent_mask_ratio = 0.0,
             teacher_model: Optional[AudioAutoencoder] = None,
-            clip_grad_norm = 0.0
+            clip_grad_norm = 0.0,
+
+
+            # =========== new parameters ===========
+            lm_config: Optional[dict] = None,
+            rate_loss_weight: float = 0.01
     ):
         super().__init__()
 
@@ -62,6 +67,55 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
         self.force_input_mono = force_input_mono
 
         self.teacher_model = teacher_model
+
+        # =========== initialize LM ===========
+        from ..models.pretransforms import AutoencoderPretransform
+        from ..models.lm import AudioLanguageModel, AudioLanguageModelWrapper
+        from ..models.codebook_patterns import DelayedPatternProvider
+        from ..models.lm_backbone import XTransformersAudioLMBackbone
+        
+        pretransform = AutoencoderPretransform(self.autoencoder)
+
+        lm_model_config = lm_config['lm']['config']
+
+        # create pattern, doesnt really matter because we only have one codebook
+        codebook_pattern = lm_config.get('codebook_pattern', 'delay')
+        if codebook_pattern == 'delay':
+            from ..models.codebook_patterns import DelayedPatternProvider
+            pattern_provider = DelayedPatternProvider(n_q=pretransform.num_quantizers)
+        elif codebook_pattern == 'parallel':
+            from ..models.codebook_patterns import ParallelPatternProvider
+            pattern_provider = ParallelPatternProvider(n_q=pretransform.num_quantizers)
+        elif codebook_pattern == 'unroll':
+            from ..models.codebook_patterns import UnrolledPatternProvider
+            pattern_provider = UnrolledPatternProvider(n_q=pretransform.num_quantizers)
+        elif codebook_pattern == 'musiclm':
+            from ..models.codebook_patterns import MusicLMPattern
+            pattern_provider = MusicLMPattern(n_q=pretransform.num_quantizers)
+        else:
+            raise ValueError(f"Unknown codebook pattern: {codebook_pattern}")
+        
+        # backbone
+        backbone = XTransformersAudioLMBackbone(**lm_model_config)
+
+        # AudioLanguageModel
+        lm_model = AudioLanguageModel(
+            pattern_provider=pattern_provider,
+            backbone=backbone,
+            num_quantizers=pretransform.num_quantizers,
+            codebook_size=pretransform.codebook_size
+        )
+
+        # wrapper params
+        lm_config_for_wrapper = {
+            'pretransform': pretransform,
+            'lm': lm_model,  # INSTANCE here, not config!!!!!!!!!!
+            'sample_rate': lm_config.get('sample_rate', self.autoencoder.sample_rate),
+            'min_input_length': lm_config.get('min_input_length', self.autoencoder.downsampling_ratio)
+        }
+
+        self.lm = AudioLanguageModelWrapper(**lm_config_for_wrapper)
+        self.rate_loss_weight = rate_loss_weight
 
         if optimizer_configs is None:
             optimizer_configs ={
@@ -280,9 +334,55 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
 
         self.validation_step_outputs = []
 
+    # =========== compute rate loss ===========
+    def _compute_cross_entropy(self, logits, targets, mask=None):
+        """
+        logits (torch.Tensor): [B, K, T, card]
+        targets (torch.Tensor): [B, K, T]
+        mask (torch.Tensor, optional): [B, K, T]
+        
+        Returns:
+            tuple: (loss, codebook_losses)
+        """
+        B, K, T = targets.shape
+        assert logits.shape[:-1] == targets.shape
+        
+        # all masks are valid
+        if mask is None:
+            mask = torch.ones_like(targets, dtype=torch.bool)
+        
+        # initialize cross entropy loss
+        ce = torch.zeros([], device=targets.device)
+        ce_per_codebook = []
+        
+        for k in range(K):
+            logits_k = logits[:, k, ...].contiguous().view(-1, logits.size(-1))  # [B x T, card]
+            targets_k = targets[:, k, ...].contiguous().view(-1)  # [B x T]
+            mask_k = mask[:, k, ...].contiguous().view(-1)  # [B x T]
+            
+            # only compute loss for valid positions
+            valid_indices = mask_k.nonzero().squeeze(-1)
+            if len(valid_indices) > 0:
+                ce_targets = targets_k[valid_indices]
+                ce_logits = logits_k[valid_indices]
+                q_ce = torch.nn.functional.cross_entropy(ce_logits, ce_targets)
+                ce += q_ce
+                ce_per_codebook.append(q_ce.detach())
+            else:
+                # if no valid positions, add zero loss
+                ce_per_codebook.append(torch.tensor(0.0, device=targets.device))
+        
+        # average over multiple codebooks
+        if K > 0:
+            ce = ce / K
+            
+        return ce, ce_per_codebook
+
 
     def configure_optimizers(self):
         gen_params = list(self.autoencoder.parameters())
+        # =========== add LM parameters to optimizer ===========
+        gen_params += list(self.lm.parameters())
 
         if self.use_disc:
             opt_gen = create_optimizer_from_config(self.optimizer_configs['autoencoder']['optimizer'], gen_params)
@@ -401,6 +501,24 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
 
         loss_info.update(encoder_info)
 
+        #  ========= calcualte CE Loss ===========  
+        rate_loss = 0.0
+        if self.lm is not None and "quantizer_indices" in encoder_info:
+            tokens = encoder_info["quantizer_indices"] 
+
+            # predict token probability distribution
+            lm_output = self.lm.compute_logits(tokens)
+            logits = lm_output.logits
+            mask = lm_output.mask
+
+            # using the logits and targets to calculate the CE loss
+            rate_loss, rate_losses = self._compute_cross_entropy(logits, tokens, mask)
+            
+            # record rate loss to log
+            log_dict['train/rate_loss'] = rate_loss.detach().item()
+            for i, loss_val in enumerate(rate_losses):
+                log_dict[f'train/rate_loss_q{i}'] = loss_val.item()
+
         # Encode with teacher model for distillation
         if self.teacher_model is not None:
             with torch.no_grad():
@@ -500,6 +618,8 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
         else:
 
             loss, losses = self.losses_gen(loss_info)
+            # ============= calculate rate loss =============
+            loss += self.rate_loss_weight * rate_loss
 
             if self.use_ema:
                 self.autoencoder_ema.update()
@@ -508,6 +628,7 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
             self.manual_backward(loss)
             if self.clip_grad_norm > 0.0:
                 torch.nn.utils.clip_grad_norm_(self.autoencoder.parameters(), self.clip_grad_norm)
+                torch.nn.utils.clip_grad_norm_(self.lm.parameters(), self.clip_grad_norm)
             opt_gen.step()
 
             if sched_gen is not None:
@@ -669,3 +790,4 @@ def create_loss_modules_from_bottleneck(bottleneck, loss_config):
         losses.append(mmd_loss)
 
     return losses
+

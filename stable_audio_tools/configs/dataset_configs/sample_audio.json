@@ -1,0 +1,12 @@
+{
+  "dataset_type": "audio_dir",
+  "datasets": [
+    {
+      "id": "audio-original",
+      "path": "/home/askrbayern/Projects/audio-compression/4-oobleck/audio-original"
+    }
+  ],
+  "extensions": ["mp3"],
+  "sample_rate": 44100,
+  "random_crop": true
+}

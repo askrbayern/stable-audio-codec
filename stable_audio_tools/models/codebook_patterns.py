@@ -168,11 +168,11 @@ class Pattern:
         indexes, mask = self._build_pattern_sequence_scatter_indexes(
             T, K, keep_only_valid_steps=keep_only_valid_steps, device=str(z.device)
         )
-        z = z.view(B, -1)
+        z = z.reshape(B, -1) # turning view to reshape
         # we append the special token as the last index of our flattened z tensor
         z = torch.cat([z, torch.zeros_like(z[:, :1]) + special_token], dim=1)
-        values = z[:, indexes.view(-1)]
-        values = values.view(B, K, indexes.shape[-1])
+        values = z[:, indexes.reshape(-1)]
+        values = values.reshape(B, K, indexes.shape[-1])
         return values, indexes, mask
 
     def _build_reverted_sequence_scatter_indexes(self, sequence_steps: int, n_q: int,

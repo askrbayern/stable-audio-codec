@@ -331,13 +331,18 @@ class DACRVQVAEBottleneck(DiscreteBottleneck):
     
 class FSQBottleneck(DiscreteBottleneck):
     def __init__(self, noise_augment_dim=0, **kwargs):
-        super().__init__(num_quantizers = kwargs.get("num_codebooks", 1), codebook_size = np.prod(kwargs["levels"]), tokens_id = "quantizer_indices")
+        super().__init__(num_quantizers = kwargs.get("num_quantizers", 1), codebook_size = np.prod(kwargs["levels"]), tokens_id = "quantizer_indices")
 
         from vector_quantize_pytorch import FSQ
 
         self.noise_augment_dim = noise_augment_dim
 
-        self.quantizer = FSQ(**kwargs, allowed_dtypes=[torch.float16, torch.float32, torch.float64])
+        try:
+            # Try with allowed_dtypes (newer versions)
+            self.quantizer = FSQ(**kwargs, allowed_dtypes=[torch.float16, torch.float32, torch.float64])
+        except TypeError:
+            # Fall back to just passing levels for older versions
+            self.quantizer = FSQ(levels=kwargs["levels"])
 
     def encode(self, x, return_info=False):
         info = {}
@@ -352,7 +357,14 @@ class FSQBottleneck(DiscreteBottleneck):
         x = x.to(orig_dtype)
 
         # Reorder indices to match the expected format
-        indices = rearrange(indices, "b n q -> b q n")
+        # Handle case where indices is 2D [batch, seq_len] instead of 3D [batch, seq_len, codebooks]
+        if len(indices.shape) == 2:
+            # Add a singleton dimension to represent a single codebook
+            indices = indices.unsqueeze(-1)
+            # Transpose to get [batch, codebook, seq_len]
+            indices = indices.transpose(1, 2)
+        else:
+            indices = rearrange(indices, "b n q -> b q n")
 
         info["quantizer_indices"] = indices
 
@@ -375,62 +387,206 @@ class FSQBottleneck(DiscreteBottleneck):
 
         return self.decode(latents, **kwargs)
  
+# class DitheredFSQBottleneck(DiscreteBottleneck):
+#     def __init__(self,
+#         dim, levels, num_codebooks = 1, dither_inference = True,
+#         noise_dropout: float = 0.05,
+#     ):
+#         from .fsq import DitheredFSQ
+
+#         # Determine codebook size and levels configuration based on the type of 'levels'
+#         if isinstance(levels, int):
+#             codebook_size = levels ** dim
+#             quantizer_levels = [levels] * dim
+
+#         elif isinstance(levels, list):
+#             if len(levels) != dim:
+#                 raise ValueError(f"Length of levels list ({len(levels)}) must match dim ({dim}).")
+#             codebook_size = 1
+#             for level in levels:
+#                 codebook_size *= level
+#             quantizer_levels = levels
+#         else:
+#             raise TypeError("Levels must be either an int or a list of ints.")
+
+#         # Initialize parent class with the determined codebook size
+#         super().__init__(
+#             num_quantizers=num_codebooks, codebook_size=codebook_size,
+#             tokens_id="quantizer_indices"
+#         )
+
+#         # Initialize the quantizer with the correct levels
+#         self.quantizer = DitheredFSQ(
+#             levels=quantizer_levels, dither_inference=dither_inference,
+#             num_codebooks=num_codebooks, noise_dropout=noise_dropout
+#         )
+
+#     def norm_std_loss(self, x):
+#         return (x.std() - 1.0) ** 2
+
+#     def encode(self, x, return_info=False):
+#         info = {}
+
+#         x = rearrange(x, "b c n -> b n c")
+#         x, indices = self.quantizer(x)
+#         x = rearrange(x, "b n c -> b c n")
+
+#         # Handle case where indices is 2D [batch, seq_len] instead of 3D [batch, seq_len, codebooks]
+#         if len(indices.shape) == 2:
+#             # Add a singleton dimension to represent a single codebook
+#             indices = indices.unsqueeze(-1)
+#             # Transpose to get [batch, codebook, seq_len]
+#             indices = indices.transpose(1, 2)
+#         else:
+#             # Original code path for 3D indices
+#             indices = rearrange(indices, "b n q -> b q n")
+
+#         info["quantizer_indices"] = indices
+        
+
+#         if return_info:
+#             return x, info
+#         else:
+#             return x
+        
+#     def decode(self, x):
+#         return x
+    
+#     def decode_tokens(self, tokens, **kwargs):
+#         latents = self.quantizer.indices_to_codes(tokens)
+
+#         return self.decode(latents, **kwargs)
+    
+
+# class DitheredFSQBottleneck(DiscreteBottleneck):
+#     def __init__(self,
+#         dim, levels, num_codebooks = 1, dither_inference = True,
+#         noise_dropout: float = 0.05,
+#     ):
+#         from .fsq import DitheredFSQ
+
+#         # Determine codebook size and levels configuration based on the type of 'levels'
+#         if isinstance(levels, int):
+#             codebook_size = levels ** dim
+#             quantizer_levels = [levels] * dim
+
+#         elif isinstance(levels, list):
+#             if len(levels) != dim:
+#                 raise ValueError(f"Length of levels list ({len(levels)}) must match dim ({dim}).")
+#             codebook_size = 1
+#             for level in levels:
+#                 codebook_size *= level
+#             quantizer_levels = levels
+#         else:
+#             raise TypeError("Levels must be either an int or a list of ints.")
+
+#         # Initialize parent class with the determined codebook size
+#         super().__init__(
+#             num_quantizers=num_codebooks, codebook_size=codebook_size,
+#             tokens_id="quantizer_indices"
+#         )
+
+#         # Initialize the quantizer with the correct levels
+#         self.quantizer = DitheredFSQ(
+#             levels=quantizer_levels, dither_inference=dither_inference,
+#             num_codebooks=num_codebooks, noise_dropout=noise_dropout
+#         )
+
+#     def norm_std_loss(self, x):
+#         return (x.std() - 1.0) ** 2
+
+#     def encode(self, x, return_info=False):
+#         info = {}
+
+#         x = rearrange(x, "b c n -> b n c")
+#         x, indices = self.quantizer(x)
+#         x = rearrange(x, "b n c -> b c n")
+
+#         # Handle case where indices is 2D [batch, seq_len] instead of 3D [batch, seq_len, codebooks]
+#         if len(indices.shape) == 2:
+#             # Add a singleton dimension to represent a single codebook
+#             indices = indices.unsqueeze(-1)
+#             # Transpose to get [batch, codebook, seq_len]
+#             indices = indices.transpose(1, 2)
+#         else:
+#             # Original code path for 3D indices
+#             indices = rearrange(indices, "b n q -> b q n")
+
+#         info["quantizer_indices"] = indices
+        
+
+#         if return_info:
+#             return x, info
+#         else:
+#             return x
+        
+#     def decode(self, x):
+#         return x
+    
+#     def decode_tokens(self, tokens, **kwargs):
+#         latents = self.quantizer.indices_to_codes(tokens)
+
+#         return self.decode(latents, **kwargs)
+
 class DitheredFSQBottleneck(DiscreteBottleneck):
-    def __init__(self,
-        dim, levels, num_codebooks = 1, dither_inference = True,
-        noise_dropout: float = 0.05,
-    ):
-        from .fsq import DitheredFSQ
-
-        # Determine codebook size and levels configuration based on the type of 'levels'
-        if isinstance(levels, int):
-            codebook_size = levels ** dim
-            quantizer_levels = [levels] * dim
-
-        elif isinstance(levels, list):
-            if len(levels) != dim:
-                raise ValueError(f"Length of levels list ({len(levels)}) must match dim ({dim}).")
-            codebook_size = 1
-            for level in levels:
-                codebook_size *= level
-            quantizer_levels = levels
-        else:
-            raise TypeError("Levels must be either an int or a list of ints.")
-
-        # Initialize parent class with the determined codebook size
+    def __init__(self, noise_augment_dim=0, **kwargs):
+        """
+        num_codebooks by default should be 1
+        codebook size is the number of levels
+        """
         super().__init__(
-            num_quantizers=num_codebooks, codebook_size=codebook_size,
-            tokens_id="quantizer_indices"
-        )
+            num_quantizers = kwargs.get("num_codebooks", 1), 
+            codebook_size = np.prod(kwargs["levels"]), 
+            tokens_id = "quantizer_indices"
+            )
 
-        # Initialize the quantizer with the correct levels
+
+        self.noise_augment_dim = noise_augment_dim
+
+        from .fsq import DitheredFSQ
         self.quantizer = DitheredFSQ(
-            levels=quantizer_levels, dither_inference=dither_inference,
-            num_codebooks=num_codebooks, noise_dropout=noise_dropout
+            levels=kwargs["levels"],
+            num_codebooks=kwargs.get("num_codebooks", 1),
+            noise_dropout=kwargs.get("noise_dropout", 0.05),
+            dither_inference=kwargs.get("dither_inference", False)
         )
-
-    def norm_std_loss(self, x):
-        return (x.std() - 1.0) ** 2
 
     def encode(self, x, return_info=False):
         info = {}
 
+        orig_dtype = x.dtype
+        x = x.float()
+
         x = rearrange(x, "b c n -> b n c")
-        x, indices = self.quantizer(x)
+        x, indices = self.quantizer(x, skip_tanh=True)
         x = rearrange(x, "b n c -> b c n")
 
+        x = x.to(orig_dtype)
+
+        # Reorder indices to match the expected format
+        # Handle case where indices is 2D [batch, seq_len] instead of 3D [batch, seq_len, codebooks]
+        if len(indices.shape) == 2:
+            # Add a singleton dimension to represent a single codebook
+            indices = indices.unsqueeze(-1)
+            # Transpose to get [batch, codebook, seq_len]
+            indices = indices.transpose(1, 2)
+        else:
+            indices = rearrange(indices, "b n q -> b q n")
+
         info["quantizer_indices"] = indices
-        
 
         if return_info:
             return x, info
         else:
             return x
         
+        
     def decode(self, x):
+        if self.noise_augment_dim > 0:
+            noise = torch.randn(x.shape[0], self.noise_augment_dim, x.shape[-1]).type_as(x)
+            x = torch.cat([x, noise], dim=1)
         return x
     
     def decode_tokens(self, tokens, **kwargs):
         latents = self.quantizer.indices_to_codes(tokens)
-
         return self.decode(latents, **kwargs)
