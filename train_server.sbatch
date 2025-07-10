@@ -18,7 +18,7 @@ export PATH="$HOME/mambaforge/bin:$PATH"
 eval "$(conda shell.bash hook)"
 conda activate /itet-stor/feigao/net_scratch/fg-envs/vec-env
 
-export WANDB_API_KEY=81c0145df67da30b28a589b1a1b66eb117859969
+export WANDB_API_KEY=[===]
 export WANDB_MODE=online
 
 cd /itet-stor/feigao/home/stable-audio-tools
