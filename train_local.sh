@@ -9,13 +9,13 @@ fi
 WANDB_PROJECT=$1
 WANDB_RUN_NAME=$2
 
-BASE_DIR=/home/askrbayern/Projects/audio-compression/stable-audio-tools-fsq
-MODEL_CONFIG=${BASE_DIR}/stable_audio_tools/configs/model_configs/test/RVQ_config.json
+BASE_DIR=/home/askrbayern/Projects/audio-compression/stable-audio-tools
+MODEL_CONFIG=${BASE_DIR}/stable_audio_tools/configs/model_configs/test/roundFSQ/withLM/ditheredFSQ_config.json
 DATA_DIR=/home/askrbayern/Projects/audio-compression/7-stable-audio/train_folder/
-INPUT_AUDIO=${BASE_DIR}/test_folder/test.mp3
+INPUT_DIR=${BASE_DIR}/test_folder/
 OUTPUT_DIR=${BASE_DIR}/test_folder
 
-BATCH_SIZE=4
+BATCH_SIZE=1
 NUM_WORKERS=6
 MAX_EPOCHS=10
 
@@ -26,7 +26,7 @@ echo "Run name: $WANDB_RUN_NAME"
 python train_start.py \
   --model-config $MODEL_CONFIG \
   --data-dir $DATA_DIR \
-  --input-audio $INPUT_AUDIO \
+  --input-dir $INPUT_DIR \
   --output-dir $OUTPUT_DIR \
   --batch-size $BATCH_SIZE \
   --num-workers $NUM_WORKERS \

@@ -2,6 +2,8 @@ import torch
 from torch import nn
 from .lm_backbone import ContinuousTransformerAudioLMBackbone
 
+_SCALE_OFFSET = 1e-2
+
 class LaplaceLanguageModel(nn.Module):
     def __init__(self, dim, lm_config):
         super().__init__()
@@ -17,4 +19,10 @@ class LaplaceLanguageModel(nn.Module):
         p = self.proj(h)                  # [B,T,2C]
         p = p.view(B, T, C, 2).permute(0,2,1,3)
         mu, log_b = p[...,0], p[...,1]
+
+        # adjust the scale by subtracting the offset before log
+        b_raw = log_b.exp()
+        b_adj = (b_raw - _SCALE_OFFSET).clamp(min=1e-6)
+        log_b = torch.log(b_adj)
+        
         return mu, log_b

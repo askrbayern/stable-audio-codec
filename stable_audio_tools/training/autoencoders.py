@@ -3,6 +3,8 @@ import torch
 import torchaudio
 import wandb
 import pytorch_lightning as pl
+from torch.autograd import Function
+import torch.nn as nn
 
 from copy import deepcopy
 from typing import Optional, Literal
@@ -20,6 +22,10 @@ from ema_pytorch import EMA
 from einops import rearrange
 from safetensors.torch import save_model
 
+# Laplace CDF helper for bitrate calculation
+def laplace_cdf(x, mu, scale):
+    return 0.5 - 0.5 * (x - mu).sign() * torch.expm1(- (x - mu).abs() / scale)
+
 def trim_to_shortest(a, b):
     """Trim the longer of two tensors to the length of the shorter one."""
     if a.shape[-1] > b.shape[-1]:
@@ -27,6 +33,25 @@ def trim_to_shortest(a, b):
     elif b.shape[-1] > a.shape[-1]:
         return a, b[:,:,:a.shape[-1]]
     return a, b
+
+
+class GradientScaleFunction(Function):
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x
+    @staticmethod
+    def backward(ctx, grad):
+        return grad * ctx.scale, None
+
+class GradientScaleLayer(nn.Module):
+    def __init__(self, scale: float):
+        super().__init__()
+        self.scale = scale
+    def forward(self, x):
+        # forward pass the same
+        # backward pass scales the gradients by self.scale
+        return GradientScaleFunction.apply(x, self.scale)
 
 class AutoencoderTrainingWrapper(pl.LightningModule):
     def __init__(
@@ -513,17 +538,35 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
 
         # Train the generator
         else:
-
             loss, losses = self.losses_gen(loss_info)
 
             if self.lm is not None:
-                mu, log_b = self.lm(latents) # [B,C,T]
+                from ..models.lm_continuous import _SCALE_OFFSET
+                lm_latents = GradientScaleLayer(self.lm_weight)(loss_info["latents"])
+                mu, log_b = self.lm(lm_latents) # [B,C,T]
                 b = log_b.exp().clamp(min=1e-6)
+                b_original = (b + _SCALE_OFFSET).clamp(min=1e-6)
                 # nll = |x - mu| / b + log(2b)
-                nll = (latents - mu).abs().div(b) + torch.log(2*b)
-                lm_loss = nll.mean() * self.lm_weight
-                loss += lm_loss
+                nll = (lm_latents - mu).abs().div(b) + torch.log(2*b)
+                lm_loss = nll.mean()
                 log_dict['train/lm_loss'] = lm_loss.detach().item()
+                log_dict['train/lm_var'] = (2 * b.pow(2)).mean().item()
+                log_dict['train/lm_var_original'] = (2 * b_original.pow(2)).mean().item()
+
+                # AE loss = D + R' (R' = λR)
+                loss += lm_loss
+
+                # log bitrate
+                with torch.no_grad():
+                    z = lm_latents.round()
+                    p = torch.clamp_min(
+                        laplace_cdf(z + 0.5, mu, b)
+                        - laplace_cdf(z - 0.5, mu, b),
+                        min=2**-16
+                    )
+                    rate = -torch.log2(p)
+                    bits_per_sample = rate.mean()
+                log_dict['train/bits_per_sample'] = bits_per_sample.item()
 
             if self.use_ema:
                 self.autoencoder_ema.update()

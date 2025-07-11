@@ -4,6 +4,7 @@ import os
 import json
 import argparse
 import math
+import glob
 
 import torch
 import torchaudio
@@ -52,64 +53,25 @@ def laplace_cdf(x, expectation, scale):
     return 0.5 - 0.5 * (shifted_x).sign() * torch.expm1(-(shifted_x).abs() / scale)
 
 class EpochReconCallback(pl.Callback):
-    def __init__(self, input_audio_path: str, output_dir: str, sample_rate: int, device: torch.device):
-        self.input_audio_path = input_audio_path
+    def __init__(self, input_dir: str, output_dir: str, sample_rate: int, device: torch.device):
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+        self.audio_paths = sorted(glob.glob(os.path.join(input_dir, "*.mp3")))
+        if not self.audio_paths:
+            raise ValueError(f"No audio files found in {input_dir}")
         self.output_dir = output_dir
         self.sample_rate = sample_rate
         self.device = device
-        
-        # Create output directory if it doesn't exist
-        os.makedirs(output_dir, exist_ok=True)
     
     @rank_zero_only
     def on_train_epoch_end(self, trainer, pl_module):
-        epoch = trainer.current_epoch + 1  # 1-indexed
-        output_path = os.path.join(self.output_dir, f"post_output_epoch_{epoch}.mp3")
-        recon(pl_module.autoencoder, self.input_audio_path, output_path, self.device, self.sample_rate)
+        # Reconstruct each audio file and save as <basename>_epoch_<N>.mp3
+        epoch = trainer.current_epoch + 1
+        for input_path in self.audio_paths:
+            base = os.path.splitext(os.path.basename(input_path))[0]
+            output_path = os.path.join(self.output_dir, f"{base}_epoch_{epoch}.mp3")
+            recon(pl_module.autoencoder, input_path, output_path, self.device, self.sample_rate)
 
-        # Only compute bitrate if language model exists
-        if hasattr(pl_module, 'lm') and pl_module.lm is not None:
-            # 1) load the same audio
-            wav = load_audio(self.input_audio_path, self.sample_rate).to(self.device)  # [1, C, N]
-
-            # 2) AE encode + LM > compute rate
-            with torch.no_grad():
-                latents, _ = pl_module.autoencoder.encode(wav, return_info=True)
-                mu, log_b = pl_module.lm(latents)
-                scale = log_b.exp().clamp(min=1e-6)
-                
-                # z are the quantized latents (assuming they're rounded)
-                z = latents.round()
-                
-                # Compute probability using Laplace CDF
-                p = torch.clamp_min(
-                    laplace_cdf(z + 0.5, mu, scale)
-                    - laplace_cdf(z - 0.5, mu, scale),
-                    min=2**-16, 
-                )
-                
-                # Compute rate in bits
-                rate = -torch.log2(p)
-                
-                # Debug information
-                print(f"latents range: [{latents.min().item():.4f}, {latents.max().item():.4f}]")
-                print(f"mu range: [{mu.min().item():.4f}, {mu.max().item():.4f}]")
-                print(f"scale range: [{scale.min().item():.4f}, {scale.max().item():.4f}]")
-                print(f"rate sum: {rate.sum().item():.4f}")
-                
-            # 3) compute bitrate
-            num_samples = wav.shape[-1]
-            seconds = num_samples / self.sample_rate
-            kbps = rate.sum() / seconds / 1024
-            bits_per_sample = rate.sum() / num_samples
-
-            # 4) print and upload
-            print(f"[Epoch {epoch}] bitrate = {kbps:.1f} kbit/s  ({bits_per_sample:.4f} bits/sample)")
-            # use Lightning's log interface, WandBLogger will handle it
-            pl_module.log("train/bitrate_kbps", kbps, on_step=False, on_epoch=True)
-            pl_module.log("train/bits_per_sample", bits_per_sample, on_step=False, on_epoch=True)
-        else:
-            print(f"[Epoch {epoch}] No language model found, skipping bitrate calculation")
 
 def main():
     parser = argparse.ArgumentParser(
@@ -119,8 +81,8 @@ def main():
                         help="Model configuration JSON with dithered_fsq + lm_config")
     parser.add_argument("--data-dir",         required=True,
                         help="Training data directory (audio_dir format)")
-    parser.add_argument("--input-audio",      required=True,
-                        help="Input audio file path for reconstruction")
+    parser.add_argument("--input-dir",      required=True,
+                        help="Input audio directory for reconstruction")
     parser.add_argument("--output-dir",       required=True,
                         help="Directory to save reconstruction outputs and checkpoints")
     parser.add_argument("--batch-size",   type=int, default=8)
@@ -189,7 +151,7 @@ def main():
     
     # Reconstruction callback - recon after every epoch
     recon_callback = EpochReconCallback(
-        input_audio_path=args.input_audio,
+        input_dir=args.input_dir,
         output_dir=args.output_dir,
         sample_rate=sample_rate,
         device=device
@@ -207,10 +169,6 @@ def main():
         callbacks=[checkpoint_callback, recon_callback]
     )
     trainer.fit(wrapper, train_dl, ckpt_path=args.ckpt_path)
-
-    # 7. Final reconstruction (optional, since we already have one from last epoch)
-    final_output = os.path.join(args.output_dir, "post_output_final.mp3")
-    recon(wrapper.autoencoder, args.input_audio, final_output, device, sample_rate)
 
 if __name__ == "__main__":
     main()
