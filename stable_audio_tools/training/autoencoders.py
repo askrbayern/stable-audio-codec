@@ -541,17 +541,13 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
             loss, losses = self.losses_gen(loss_info)
 
             if self.lm is not None:
-                from ..models.lm_continuous import _SCALE_OFFSET
                 lm_latents = GradientScaleLayer(self.lm_weight)(loss_info["latents"])
-                mu, log_b = self.lm(lm_latents) # [B,C,T]
-                b = log_b.exp().clamp(min=1e-6)
-                b_original = (b + _SCALE_OFFSET).clamp(min=1e-6)
+                mu, b = self.lm(lm_latents) # [B,C,T] - now returns b directly
                 # nll = |x - mu| / b + log(2b)
                 nll = (lm_latents - mu).abs().div(b) + torch.log(2*b)
                 lm_loss = nll.mean()
                 log_dict['train/lm_loss'] = lm_loss.detach().item()
                 log_dict['train/lm_var'] = (2 * b.pow(2)).mean().item()
-                log_dict['train/lm_var_original'] = (2 * b_original.pow(2)).mean().item()
 
                 # AE loss = D + R' (R' = λR)
                 loss += lm_loss
@@ -565,8 +561,16 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
                         min=2**-16
                     )
                     rate = -torch.log2(p)
-                    bits_per_sample = rate.mean()
+                    # mean over all dimensions, then multiply by number of features
+                    bits_per_sample = rate.mean() * rate.shape[1]  # C = number of features
+                    # if you do sum you have to pay attention to the batch 
+                    
                 log_dict['train/bits_per_sample'] = bits_per_sample.item()
+                # bits per second = bits/latent × (audio_sample_rate / downsampling_ratio)
+                bits_per_second = bits_per_sample * (
+                    self.autoencoder.sample_rate / self.autoencoder.downsampling_ratio
+                )
+                log_dict['train/bits_per_second'] = bits_per_second.item()
 
             if self.use_ema:
                 self.autoencoder_ema.update()
