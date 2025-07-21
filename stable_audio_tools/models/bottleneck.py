@@ -46,7 +46,7 @@ class RoundBottleneck(Bottleneck):
         # x: [B, C, T]
         assert x.shape[1] == self.latent_dim, f"Expected channels={self.latent_dim}, got {x.shape[1]}"
 
-        if self.dither:
+        if self.dither and self.training:  # Only dither during training
             x = x + (torch.rand_like(x) - 0.5)
 
         q = round_ste(x)          # forward round, gradient pass
