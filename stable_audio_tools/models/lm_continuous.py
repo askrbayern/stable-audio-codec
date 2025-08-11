@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from .lm_backbone import ContinuousTransformerAudioLMBackbone
 
-_SCALE_OFFSET = 1e-4
+_SCALE_OFFSET = -4
 
 class LaplaceLanguageModel(nn.Module):
     def __init__(self, dim, lm_config):
