@@ -541,87 +541,50 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
             loss, losses = self.losses_gen(loss_info)
 
             if self.lm is not None:
-           
-                # if self.global_step < 100000:
-                #     # Phase 1: Very low LM weight
-                #     current_lm_weight = self.lm_weight * 0
-                # elif self.global_step < 150000:
-                #     # Phase 2: Low LM weight  
-                #     current_lm_weight = self.lm_weight * 0.01
-                # elif self.global_step < 200000:
-                #     # Phase 3: Medium LM weight
-                #     current_lm_weight = self.lm_weight * 0.1
-                # elif self.global_step < 250000:
-                #     # Phase 4: High LM weight
-                #     current_lm_weight = self.lm_weight * 1.0
-                # elif self.global_step < 300000:
-                #     # Phase 5: Maximum LM weight
-                #     current_lm_weight = self.lm_weight * 10.0
-                # else:
-                #     # Phase 6: Maximum LM weight
-                #     current_lm_weight = self.lm_weight * 100.0
-
                 current_lm_weight = self.lm_weight
                 
                 lm_latents = GradientScaleLayer(current_lm_weight)(loss_info["latents"])
                 mu, b = self.lm(lm_latents)
-                nll = (lm_latents - mu).abs().div(b) + torch.log(2*b)
-                
-                lm_loss = nll.mean()
+
+                # continuous loss
+                # nll = (lm_latents - mu).abs().div(b) + torch.log(2*b)
+
+                # discrete loss
+                p = torch.clamp_min(
+                    laplace_cdf(lm_latents + 0.5, mu, b)
+                    - laplace_cdf(lm_latents - 0.5, mu, b),
+                    min=2**-24 
+                )
+
+                rate = -torch.log2(p)
+                lm_loss = rate.mean()
                 loss += lm_loss
-
-                log_dict['train/lm_loss'] = lm_loss.item()
-                log_dict['train/lm_var'] = (2 * b.pow(2)).mean().item()
-                log_dict['train/current_lm_weight'] = current_lm_weight
-
-                # log bitrate
-                with torch.no_grad():
-                    z = lm_latents.round()
-                    p = torch.clamp_min(
-                        laplace_cdf(z + 0.5, mu, b)
-                        - laplace_cdf(z - 0.5, mu, b),
-                        min=2**-18 # only for logging purposes
-                    )
-                    rate = -torch.log2(p)
-                    # mean over all dimensions, then multiply by number of features
-                    bits_per_sample = rate.mean() * rate.shape[1]  # C = number of features
-                    # if you do sum you have to pay attention to the batch 
-                    
+                
+                # mean over all dimensions, then multiply by number of features
+                bits_per_sample = rate.mean() * rate.shape[1]  # C = number of features
+                # if you do sum you have to pay attention to the batch
+                
                 log_dict['train/bits_per_sample'] = bits_per_sample.item()
                 # bits per second = bits/latent × (audio_sample_rate / downsampling_ratio)
                 bits_per_second = bits_per_sample * (
                     self.autoencoder.sample_rate / self.autoencoder.downsampling_ratio
                 )
                 log_dict['train/bits_per_second'] = bits_per_second.item()
+                
+                
+                log_dict['train/lm_loss'] = lm_loss.item()
+                log_dict['train/lm_var'] = (2 * b.pow(2)).mean().item()
+                # log_dict['train/current_lm_weight'] = current_lm_weight
 
                 # Additional diagnostics (visualization-only)
                 with torch.no_grad():
                     # Scale diagnostics
                     log_dict['train/lm_b_mean'] = b.mean().item()
-                    try:
-                        log_dict['train/lm_b_median'] = b.median().item()
-                    except Exception:
-                        pass
-
                     # Alignment diagnostics (use raw latents, not gradient-scaled)
                     latents_raw = loss_info.get("latents", lm_latents)
-                    log_dict['train/latents_to_int'] = (latents_raw - latents_raw.round()).abs().mean().item()
                     log_dict['train/mu_to_latents'] = (mu - latents_raw).abs().mean().item()
-                    # LM vs AE's quantization grid alignment
-                    log_dict['train/mu_to_latents_int'] = (mu - latents_raw.round()).abs().mean().item()
                     # LM's absolute alignment to integer grid
                     log_dict['train/mu_to_int'] = (mu - mu.round()).abs().mean().item()
-
-                    # Second uncapped bitrate (for diagnostics; looser clamp to reduce saturation at 16 bits)
-                    p_uncapped = torch.clamp_min(
-                        laplace_cdf(z + 0.5, mu, b) - laplace_cdf(z - 0.5, mu, b),
-                        min=2**-24
-                    )
-                    rate_uncapped = -torch.log2(p_uncapped)
-                    bps_uncapped = (rate_uncapped.mean() * rate_uncapped.shape[1]) * (
-                        self.autoencoder.sample_rate / self.autoencoder.downsampling_ratio
-                    )
-                    log_dict['train/bits_per_second_uncapped'] = bps_uncapped.item()
 
             if self.use_ema:
                 self.autoencoder_ema.update()
