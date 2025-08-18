@@ -55,7 +55,7 @@
       "type": "round_fsq",
       "config": {
         "latent_dim": 64,
-        "dither": false
+        "dither": true
       }
     },
     "latent_dim": 64,
