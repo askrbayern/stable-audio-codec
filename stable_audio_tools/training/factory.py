@@ -39,6 +39,12 @@ def create_training_wrapper_from_config(model_config, model):
             else:
                 raise ValueError("teacher_model_ckpt must be specified if teacher_model is specified")
 
+        # ========== Pass LM config into wrapper to load lm.* keys correctly ==========
+        model_section = model_config.get("model", {})
+        lm_cfg = model_section.get("lm", None)
+        lm_weight = model_section.get("lm_weight", 1.0)
+        # =============================================================================
+
         return AutoencoderTrainingWrapper(
             model, 
             lr=training_config.get("learning_rate", None),
@@ -52,7 +58,11 @@ def create_training_wrapper_from_config(model_config, model):
             ema_copy=ema_copy if use_ema else None,
             force_input_mono=training_config.get("force_input_mono", False),
             latent_mask_ratio=latent_mask_ratio,
-            teacher_model=teacher_model
+            teacher_model=teacher_model,
+            # ========== need to return lm as well ==========
+            lm_config=lm_cfg,
+            lm_weight=lm_weight,
+            # ===============================================
         )
     elif model_type == 'diffusion_uncond':
         from .diffusion import DiffusionUncondTrainingWrapper

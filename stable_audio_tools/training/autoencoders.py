@@ -541,6 +541,7 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
             loss, losses = self.losses_gen(loss_info)
 
             if self.lm is not None:
+                losses['ae_loss'] = loss.clone()
                 current_lm_weight = self.lm_weight
                 
                 lm_latents = GradientScaleLayer(current_lm_weight)(loss_info["latents"])
@@ -558,6 +559,7 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
 
                 rate = -torch.log2(p)
                 lm_loss = rate.mean()
+                losses['lm_loss'] = lm_loss
                 loss += lm_loss
                 
                 # mean over all dimensions, then multiply by number of features
@@ -570,9 +572,7 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
                     self.autoencoder.sample_rate / self.autoencoder.downsampling_ratio
                 )
                 log_dict['train/bits_per_second'] = bits_per_second.item()
-                
-                
-                log_dict['train/lm_loss'] = lm_loss.item()
+                # log_dict['train/lm_loss'] = lm_loss.item()
                 log_dict['train/lm_var'] = (2 * b.pow(2)).mean().item()
                 # log_dict['train/current_lm_weight'] = current_lm_weight
 
