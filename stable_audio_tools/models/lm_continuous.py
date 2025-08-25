@@ -11,7 +11,6 @@ class LaplaceLanguageModel(nn.Module):
         backbone_cfg = lm_config.get("backbone", {})
         self.backbone = ContinuousTransformerAudioLMBackbone(embed_dim=dim, **backbone_cfg)
         self.proj = nn.Linear(self.backbone.embed_dim, dim * 2)  # μ and b
-        self.proj = nn.Linear(self.backbone.embed_dim, dim * 2)  # μ and b
 
     def forward(self, latents):
         B,C,T = latents.shape
@@ -28,5 +27,4 @@ class LaplaceLanguageModel(nn.Module):
         # try several different values and it should be IMMEDIATELY obvious
         # 1e-4 is too small (basically like turning it off)
         
-        return mu, b
         return mu, b

@@ -512,15 +512,48 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
             else:
                 sched_gen = lr_schedulers
 
-        # Train the discriminator
+        # ============
+        # Use internal counter instead of global_step for reliable alternating
+        if not hasattr(self, '_internal_step_counter'):
+            self._internal_step_counter = 0
+
+        # Post-resume debug logging for the first N steps
+        # DEBUGGING STEPS!
+        if getattr(self, "_post_resume_debug_steps", 0) > 0:
+            try:
+                # Log LRs
+                if self.use_disc:
+                    log_dict['debug/gen_lr'] = opt_gen.param_groups[0]['lr']
+                    log_dict['debug/disc_lr'] = opt_disc.param_groups[0]['lr']
+                    if 'opt_lm' in locals() and opt_lm is not None:
+                        log_dict['debug/lm_lr'] = opt_lm.param_groups[0]['lr']
+                else:
+                    log_dict['debug/gen_lr'] = opt_gen.param_groups[0]['lr']
+                # LM optimizer step stats
+                if 'opt_lm' in locals() and opt_lm is not None:
+                    lm_steps = [int(st['step']) for st in opt_lm.state.values() if isinstance(st, dict) and 'step' in st]
+                    if len(lm_steps) > 0:
+                        log_dict['debug/lm_step_min'] = min(lm_steps)
+                        log_dict['debug/lm_step_max'] = max(lm_steps)
+                        log_dict['debug/lm_step_mean'] = sum(lm_steps) / float(len(lm_steps))
+                # Flag if param order mismatch was detected
+                log_dict['debug/lm_param_order_mismatch'] = 1 if getattr(self, '_lm_param_order_mismatch', False) else 0
+            except Exception as _e:
+                # Keep training robust in case of any debug logging issues
+                pass
+            finally:
+                self._post_resume_debug_steps = max(0, self._post_resume_debug_steps - 1)
+
+
         use_disc = (
             self.use_disc
-            and self.global_step % 2
-            # Check warmup mode and if it is time to use discriminator.
+            and self._internal_step_counter % 2 == 1  # only use discriminator every other step
             and (
                 (self.warmup_mode == "full" and self.warmed_up)
                 or self.warmup_mode == "adv")
         )
+        # ============
+        
         if use_disc:
             loss, losses = self.losses_disc(loss_info)
 
@@ -574,6 +607,17 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
                 log_dict['train/bits_per_second'] = bits_per_second.item()
                 # log_dict['train/lm_loss'] = lm_loss.item()
                 log_dict['train/lm_var'] = (2 * b.pow(2)).mean().item()
+                # Diagnostics for resume consistency
+                if self.use_disc:
+                    try:
+                        log_dict['train/lm_lr'] = opt_lm.param_groups[0]['lr']
+                    except Exception:
+                        pass
+                # Track LM head magnitude to detect resets
+                try:
+                    log_dict['train/lm_proj_norm'] = self.lm.proj.weight.norm().detach().item()
+                except Exception:
+                    pass
                 # log_dict['train/current_lm_weight'] = current_lm_weight
 
                 # Additional diagnostics (visualization-only)
@@ -592,12 +636,49 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
             opt_gen.zero_grad()
             if self.lm is not None: # empty grads for LM
                 opt_lm.zero_grad()
+            # =========== BATCH START ==========
+            # Lightweight LM gradient diagnostics before optimizer step
+            if self.lm is not None:
+                try:
+                    num_params = 0
+                    num_has_grad = 0
+                    grad_norm_accum = 0.0
+                    for p in self.lm.parameters():
+                        num_params += 1
+                        if p.grad is not None:
+                            num_has_grad += 1
+                            with torch.no_grad():
+                                grad_norm_accum += float(p.grad.detach().data.norm(2).item())
+                    if num_params > 0:
+                        self.log('debug/lm_params_with_grad', float(num_has_grad), prog_bar=False, on_step=True)
+                        self.log('debug/lm_zero_grad_ratio', float((num_params - num_has_grad) / num_params), prog_bar=False, on_step=True)
+                        self.log('debug/lm_grad_norm', float(grad_norm_accum), prog_bar=False, on_step=True)
+                except Exception:
+                    pass
+                # AMP scaler scale (if available)
+                try:
+                    scaler = getattr(getattr(self.trainer, 'precision_plugin', None), 'scaler', None)
+                    if scaler is not None:
+                        self.log('debug/scaler_scale', float(scaler.get_scale()), prog_bar=False, on_step=True)
+                except Exception:
+                    pass
+            # ============ BATCH END ==========
             self.manual_backward(loss)
             if self.clip_grad_norm > 0.0:
                 torch.nn.utils.clip_grad_norm_(self.autoencoder.parameters(), self.clip_grad_norm)
             opt_gen.step()
             if self.lm is not None: # step LM opt
                 opt_lm.step()
+                # =========== BATCH START ==========
+                # Post-step LM optimizer step stats
+                try:
+                    lm_steps_post = [int(st['step']) for st in opt_lm.state.values() if isinstance(st, dict) and 'step' in st]
+                    if len(lm_steps_post) > 0:
+                        self.log('debug/lm_step_min_post', float(min(lm_steps_post)), prog_bar=False, on_step=True)
+                        self.log('debug/lm_step_max_post', float(max(lm_steps_post)), prog_bar=False, on_step=True)
+                except Exception:
+                    pass
+                # ============ BATCH END ==========
 
             if sched_gen is not None:
                 # scheduler step every step
@@ -612,8 +693,70 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
             log_dict[f'train/{loss_name}'] = loss_value.detach().item()
 
         self.log_dict(log_dict, prog_bar=True, on_step=True)
+        
+        # ============
+        # Increment internal counter at the end of each training_step
+        self._internal_step_counter += 1
+        # ============
 
         return loss
+
+    # ==================== save step counter and EMA state ====================
+    def on_save_checkpoint(self, checkpoint):
+        if hasattr(self, '_internal_step_counter'):
+            checkpoint['_internal_step_counter'] = self._internal_step_counter
+        
+        if self.use_ema and self.autoencoder_ema is not None:
+            checkpoint['autoencoder_ema_state_dict'] = self.autoencoder_ema.ema_model.state_dict()
+            checkpoint['autoencoder_ema_object_state'] = self.autoencoder_ema.state_dict()
+        
+        if getattr(self, 'lm', None) is not None:
+            try:
+                checkpoint['lm_state_dict'] = self.lm.state_dict()
+                checkpoint['lm_param_names'] = [name for name, _ in self.lm.named_parameters()]
+                if hasattr(self, 'lm_config') and self.lm_config is not None:
+                    checkpoint['lm_config'] = self.lm_config
+                print(f"[Checkpoint] Saved LM state dict with {len(checkpoint['lm_state_dict'])} parameters")
+            except Exception as e:
+                print(f"[Checkpoint] Failed to save LM state: {e}")
+                pass
+
+    def on_load_checkpoint(self, checkpoint):
+        if '_internal_step_counter' in checkpoint:
+            self._internal_step_counter = checkpoint['_internal_step_counter']
+        
+        if self.use_ema and self.autoencoder_ema is not None:
+            if 'autoencoder_ema_state_dict' in checkpoint:
+                self.autoencoder_ema.ema_model.load_state_dict(checkpoint['autoencoder_ema_state_dict'])
+            if 'autoencoder_ema_object_state' in checkpoint:
+                self.autoencoder_ema.load_state_dict(checkpoint['autoencoder_ema_object_state'])
+        
+        self._lm_param_order_mismatch = False
+        if getattr(self, 'lm', None) is not None:
+            if 'lm_state_dict' in checkpoint:
+                try:
+                    self.lm.load_state_dict(checkpoint['lm_state_dict'])
+                    print(f"[Checkpoint] Successfully loaded LM state dict with {len(checkpoint['lm_state_dict'])} parameters")
+                except Exception as e:
+                    print(f"[Checkpoint] Failed to load LM state dict: {e}")
+                    print("[Checkpoint] LM will start with random initialization")
+            else:
+                print("[Checkpoint] No LM state dict found in checkpoint, LM will start with random initialization")
+            
+            if 'lm_param_names' in checkpoint:
+                try:
+                    saved = checkpoint.get('lm_param_names', None)
+                    current = [name for name, _ in self.lm.named_parameters()]
+                    if isinstance(saved, list) and saved != current:
+                        self._lm_param_order_mismatch = True
+                        print('[Warning] LM parameter order mismatch detected between checkpoint and current model.\n'
+                              'Optimizer state alignment for LM may be invalid. Consider reinitializing LM optimizer.')
+                except Exception as _e:
+                    pass
+        
+        self._post_resume_debug_steps = 50
+
+    # ==================== save step counter and EMA state ====================
 
     def export_model(self, path, use_safetensors=False):
         if self.autoencoder_ema is not None:

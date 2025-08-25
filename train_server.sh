@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -e
 
-if [ $# -ne 5 ]; then
-    echo "Usage: $0 <config_name> <lambda> <wandb_project> <wandb_run_name> <continue|new>"
+if [ $# -lt 5 ]; then
+    echo "Usage: $0 <config_name> <lambda> <wandb_project> <wandb_run_name> <continue|new|activation>"
     exit 1
 fi
 
@@ -36,14 +36,15 @@ with open('$MODEL_CONFIG', 'w') as f:
 fi
 
 DATA_DIR=/itet-stor/feigao/disco-computing/music_datasets/jamendo/raw_30s
-INPUT_AUDIO=/itet-stor/feigao/home/stable-audio-tools/test_folder/test.mp3
-OUTPUT_DIR=${BASE_DIR}/outputs/${WANDB_PROJECT}/${WANDB_RUN_NAME}
-CHECKPOINT_PATH=${OUTPUT_DIR}/checkpoints/best_checkpoint.ckpt
+# SMALL_DATA_DIR=/itet-stor/feigao/disco-computing/music_datasets/jamendo/raw_30s/00
+INPUT_DIR=/itet-stor/feigao/home/stable-audio-tools/test_folder/
+OUTPUT_DIR=/itet-stor/feigao/net_scratch/outputs/${WANDB_PROJECT}/${WANDB_RUN_NAME}
+CHECKPOINT_PATH=${OUTPUT_DIR}/checkpoints/last.ckpt
 
 NUM_GPUS=2
-BATCH_SIZE=2
-NUM_WORKERS=6
-MAX_EPOCHS=16
+BATCH_SIZE=4
+NUM_WORKERS=8
+MAX_EPOCHS=300
 
 echo "Model config: $MODEL_CONFIG"
 echo "Lambda (lm_weight): $LAMBDA"
@@ -59,7 +60,7 @@ if [ "$RESUME_MODE" = "continue" ]; then
     python train_start.py \
       --model-config $MODEL_CONFIG \
       --data-dir $DATA_DIR \
-      --input-audio $INPUT_AUDIO \
+      --input-dir $INPUT_DIR \
       --output-dir $OUTPUT_DIR \
       --batch-size $BATCH_SIZE \
       --num-workers $NUM_WORKERS \
@@ -73,7 +74,7 @@ elif [ "$RESUME_MODE" = "new" ]; then
     python train_start.py \
       --model-config $MODEL_CONFIG \
       --data-dir $DATA_DIR \
-      --input-audio $INPUT_AUDIO \
+      --input-dir $INPUT_DIR \
       --output-dir $OUTPUT_DIR \
       --batch-size $BATCH_SIZE \
       --num-workers $NUM_WORKERS \
@@ -82,6 +83,38 @@ elif [ "$RESUME_MODE" = "new" ]; then
       --wandb-run-name $WANDB_RUN_NAME \
       --accelerator gpu \
       --devices $NUM_GPUS
+elif [ "$RESUME_MODE" = "inspect" ]; then
+    echo "Entering inspect mode: extracting latents"
+    # Run inspect in train_start.py
+    python train_start.py \
+      --model-config $MODEL_CONFIG \
+      --data-dir $DATA_DIR \
+      --input-dir $DATA_DIR \
+      --output-dir $OUTPUT_DIR \
+      --batch-size 1 \
+      --num-workers 1 \
+      --max-epochs 1 \
+      --accelerator cpu \
+      --devices 0 \
+      --inspect \
+      --inspect-count 5 \
+      --ckpt-path $CHECKPOINT_PATH
+    exit 0
+elif [ "$RESUME_MODE" = "activation" ]; then
+    echo "Activation mode: train 1 epoch, eval, save, reload, eval again"
+    python train_start_activation.py \
+      --model-config $MODEL_CONFIG \
+      --data-dir $DATA_DIR \
+      --input-dir $INPUT_DIR \
+      --output-dir $OUTPUT_DIR \
+      --batch-size $BATCH_SIZE \
+      --num-workers $NUM_WORKERS \
+      --max-epochs 5 \
+      --wandb-project $WANDB_PROJECT \
+      --wandb-run-name $WANDB_RUN_NAME \
+      --accelerator gpu \
+      --devices $NUM_GPUS
+
 else
     echo "Unknown resume mode: $RESUME_MODE. Use 'continue' or 'new'."
     exit 1

@@ -169,6 +169,19 @@ class AudioLanguageModelTrainingWrapper(pl.LightningModule):
         if self.model_ema is not None:
             self.model_ema.update()
 
+    # ==================== save and load EMA state ====================
+    def on_save_checkpoint(self, checkpoint):
+        if self.model_ema is not None:
+            checkpoint['ema_state_dict'] = self.model_ema.ema_model.state_dict()
+            checkpoint['ema_object_state'] = self.model_ema.state_dict()
+
+    def on_load_checkpoint(self, checkpoint):
+        if self.model_ema is not None and 'ema_state_dict' in checkpoint:
+            self.model_ema.ema_model.load_state_dict(checkpoint['ema_state_dict'])
+            if 'ema_object_state' in checkpoint:
+                self.model_ema.load_state_dict(checkpoint['ema_object_state'])
+    # ==================== save and load EMA state ====================
+
     def export_model(self, path, use_safetensors=False):
         
         model = self.model_ema.ema_model if self.model_ema is not None else self.model

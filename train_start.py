@@ -1,4 +1,4 @@
-# file: train_server.py
+# file: train_start.py
 #!/usr/bin/env python3
 import os
 import json
@@ -16,6 +16,49 @@ from pytorch_lightning.utilities.rank_zero import rank_zero_only
 from stable_audio_tools.data.dataset import create_dataloader_from_config
 from stable_audio_tools.models import create_model_from_config
 from stable_audio_tools.training.factory import create_training_wrapper_from_config
+
+class ExceptionCallback(pl.Callback):
+    def on_exception(self, trainer, module, err):
+        print(f"{type(err).__name__}: {err}")
+
+class ModelConfigEmbedderCallback(pl.Callback):
+    def __init__(self, model_config):
+        self.model_config = model_config
+
+    def on_save_checkpoint(self, trainer, pl_module, checkpoint):
+        checkpoint["model_config"] = self.model_config
+
+class OptimizerStateCallback(pl.Callback):
+    """Force-save optimizer states to avoid empty optimizer state issues when resuming.
+    """
+    def on_save_checkpoint(self, trainer, pl_module, checkpoint):
+        try:
+            if hasattr(trainer, "optimizers") and trainer.optimizers:
+                checkpoint["custom_optimizer_states"] = [opt.state_dict() for opt in trainer.optimizers]
+                print(f"OptimizerStateCallback: Saved {len(trainer.optimizers)} optimizer states")
+        except Exception as e:
+            print(f"OptimizerStateCallback on_save_checkpoint warning: {e}")
+
+    def on_load_checkpoint(self, trainer, pl_module, checkpoint):
+        try:
+            if "custom_optimizer_states" in checkpoint:
+                custom_states = checkpoint["custom_optimizer_states"]
+                print(f"OptimizerStateCallback: Found {len(custom_states)} custom optimizer states")
+                
+                # Ensure trainer has optimizers before loading
+                if hasattr(trainer, "optimizers") and trainer.optimizers:
+                    for i, opt_state in enumerate(custom_states):
+                        if i < len(trainer.optimizers):
+                            trainer.optimizers[i].load_state_dict(opt_state)
+                            print(f"OptimizerStateCallback: Loaded optimizer {i} state")
+                        else:
+                            print(f"OptimizerStateCallback: Warning - optimizer {i} state found but no matching optimizer")
+                else:
+                    print("OptimizerStateCallback: Warning - no trainer.optimizers available during load")
+            else:
+                print("OptimizerStateCallback: No custom_optimizer_states found in checkpoint")
+        except Exception as e:
+            print(f"OptimizerStateCallback on_load_checkpoint warning: {e}")
 
 def load_audio(path: str, sample_rate: int) -> torch.Tensor:
     audio, sr = torchaudio.load(path)
@@ -91,6 +134,20 @@ def laplace_cdf(x, expectation, scale):
     shifted_x = x - expectation
     return 0.5 - 0.5 * (shifted_x).sign() * torch.expm1(-(shifted_x).abs() / scale)
 
+class AfterLoadSaveCallback(pl.Callback):
+    """Save a checkpoint immediately after loading for debugging."""
+    def __init__(self, checkpoint_dir: str, enabled: bool = False):
+        self.checkpoint_dir = checkpoint_dir
+        self.enabled = enabled
+        self.saved = False
+    
+    def on_train_start(self, trainer, pl_module):
+        if self.enabled and not self.saved:
+            after_load_path = os.path.join(self.checkpoint_dir, "after_load.ckpt")
+            trainer.save_checkpoint(after_load_path)
+            print(f"[AfterLoadSave] Saved after_load checkpoint to: {after_load_path}")
+            self.saved = True
+
 class EpochReconCallback(pl.Callback):
     def __init__(self, input_dir: str, output_dir: str, sample_rate: int, device: torch.device):
         # Create output directory
@@ -147,6 +204,7 @@ def main():
     parser.add_argument("--precision",    type=str, default="16-mixed")
     parser.add_argument("--accelerator",  type=str, default="auto")
     parser.add_argument("--devices",      type=int, default=1)
+    parser.add_argument("--checkpoint-every", type=int, default=50000)
     parser.add_argument("--inspect", action="store_true", help="Inspect mode: extract latents and save to output_dir/inspect")
     parser.add_argument("--inspect-count", type=int, default=10, help="Number of samples to extract latents for in inspect mode")
     parser.add_argument("--wandb-project", type=str, default="stable_audio_tools", help="Weights & Biases project name")
@@ -209,6 +267,7 @@ def main():
             print(f"Saved reconstruction for {base} -> {recon_path}")
         return
 
+
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
@@ -216,14 +275,30 @@ def main():
     with open(args.model_config) as f:
         model_cfg = json.load(f)
 
-    # 1.5 Setup W&B logger
-    wandb_logger = WandbLogger(project=args.wandb_project, name=args.wandb_run_name)
+    # 1.5 Setup W&B logger - improved
+    if args.ckpt_path and os.path.exists(args.ckpt_path):
+        # Resume existing run - use provided run name as deterministic ID
+        wandb_logger = WandbLogger(
+            project=args.wandb_project, 
+            name=args.wandb_run_name,
+            resume="allow",
+            id=args.wandb_run_name,
+            save_dir=args.output_dir
+        )
+    else:
+        # New run - still pin a deterministic ID to avoid random run folders
+        wandb_logger = WandbLogger(
+            project=args.wandb_project, 
+            name=args.wandb_run_name,
+            id=args.wandb_run_name,
+            save_dir=args.output_dir
+        )
 
     # 2. Construct dataset_config for DataLoader
     data_cfg = {
         "dataset_type": "audio_dir",
         "datasets": [{"id": "train", "path": args.data_dir}],
-        "random_crop": True,
+        "random_crop": False,
         "drop_last": True
     }
     sample_rate = model_cfg["sample_rate"]
@@ -240,25 +315,24 @@ def main():
 
     # 4. Model + Wrapper
     model = create_model_from_config(model_cfg)                      # AudioAutoencoder
+    # Let the factory inject LM consistently as in official train.py
     wrapper = create_training_wrapper_from_config(model_cfg, model)  # LightningModule
-    lm_cfg = model_cfg["model"].get("lm", None)
-    lm_weight = model_cfg["model"].get("lm_weight", 1.0)
-    if lm_cfg is not None:
-        from stable_audio_tools.models.lm_continuous import LaplaceLanguageModel
-        wrapper.lm = LaplaceLanguageModel(wrapper.autoencoder.latent_dim, lm_cfg)
-        wrapper.lm_weight = lm_weight
-        wrapper.lm_config = lm_cfg
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.devices>0 else "cpu")
 
     # 5. Setup callbacks
-    # Checkpoint callback - save only the best performing checkpoints
+    # Deterministic checkpoint directory, independent of W&B run ID
+    checkpoint_dir = os.path.join(args.output_dir, "checkpoints")
+
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # Save every N steps and keep last.ckpt, aligning with official behavior
     checkpoint_callback = ModelCheckpoint(
-        dirpath=os.path.join(args.output_dir, "checkpoints"),
-        filename="best_checkpoint",
+        every_n_train_steps=args.checkpoint_every,
+        dirpath=checkpoint_dir,
         monitor="train/loss",
         mode="min",
-        save_top_k=1,
+        save_top_k=-1,
         save_last=True
     )
     
@@ -269,8 +343,17 @@ def main():
         sample_rate=sample_rate,
         device=device
     )
+    
+    # After load save callback - only enabled when resuming
+    after_load_callback = AfterLoadSaveCallback(
+        checkpoint_dir=checkpoint_dir,
+        enabled=bool(args.ckpt_path and os.path.exists(args.ckpt_path))
+    )
 
-    # 6. Training
+    # 6. Training - simplified callbacks, keep only essential ones
+    # ============
+    # ServerTrue: Keep only checkpoint and reconstruction callbacks
+    # ============
     trainer = pl.Trainer(
         accelerator=args.accelerator,
         devices=args.devices,
@@ -279,9 +362,13 @@ def main():
         max_epochs=args.max_epochs,
         log_every_n_steps=50,
         logger=wandb_logger,
-        callbacks=[checkpoint_callback, recon_callback]
+        callbacks=[checkpoint_callback, recon_callback, after_load_callback],
+        enable_checkpointing=True,
+        default_root_dir=args.output_dir
     )
-    trainer.fit(wrapper, train_dl, ckpt_path=args.ckpt_path)
+    
+    # Use correct checkpoint resuming method
+    trainer.fit(wrapper, train_dl, ckpt_path=args.ckpt_path if args.ckpt_path else None)
 
 if __name__ == "__main__":
     main()
