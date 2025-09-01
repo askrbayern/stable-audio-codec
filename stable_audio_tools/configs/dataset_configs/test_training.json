@@ -1,0 +1,22 @@
+{
+  "dataset_type": "audio_dir",
+  "random_crop": true,
+  "drop_last": true,
+  "balanced_domains": true,
+  "domains": ["music", "speech", "env"],
+  "ensure_full_band_per_batch": true,
+  "volume_norm": true,
+  "volume_norm_param": [-24, 0],
+  "datasets": [
+    { "id": "jamendo", "path": "/itet-stor/feigao/disco-computing/music_datasets/jamendo/raw_30s", "domain": "music", "assume_full_band": true },
+    { "id": "musdb",   "path": "/itet-stor/feigao/net_scratch/datasets/musdb/musdb18hq/train",               "domain": "music", "assume_full_band": true },
+
+    { "id": "daps_fullband",    "path": "/itet-stor/feigao/net_scratch/datasets/daps/daps/train_fullband",                      "domain": "speech", "assume_full_band": true },
+    { "id": "daps_device",    "path": "/itet-stor/feigao/net_scratch/datasets/daps/daps/train_device",                      "domain": "speech", "assume_full_band": false },
+    { "id": "cv",      "path": "/itet-stor/feigao/net_scratch/datasets/common_voice/cv-corpus-22.0-2025-06-20/en/clips",              "domain": "speech", "assume_full_band": false },
+    { "id": "vctk",      "path": "/itet-stor/feigao/net_scratch/datasets/vctk/DS_10283_3443/wav48_silence_trimmed",              "domain": "speech", "assume_full_band": true },
+
+    { "id": "audioset","path": "/itet-stor/feigao/net_scratch/datasets/audioset/hf/extracted/audio/bal_train",     "domain": "env", "assume_full_band": false },
+    { "id": "audioset","path": "/itet-stor/feigao/net_scratch/datasets/audioset/hf/extracted/audio/unbal_train",     "domain": "env", "assume_full_band": false }
+  ]
+}

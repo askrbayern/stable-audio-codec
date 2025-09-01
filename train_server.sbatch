@@ -1,9 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=stable-audio-train
-#SBATCH --output=logs/train_%j.out
-#SBATCH --error=logs/train_%j.err
-#SBATCH --gres=gpu:geforce_rtx_3090:2
-#SBATCH --nodelist=tikgpu07
+#SBATCH --output=/itet-stor/feigao/net_scratch/logs/train_%j.out
+#SBATCH --error=/itet-stor/feigao/net_scratch/logs/train_%j.err
+#SBATCH --gres=gpu:geforce_rtx_3090:4
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=48:00:00
@@ -18,7 +17,7 @@ export PATH="$HOME/mambaforge/bin:$PATH"
 eval "$(conda shell.bash hook)"
 conda activate /itet-stor/feigao/net_scratch/fg-envs/vec-env
 
-export WANDB_API_KEY=
+export WANDB_API_KEY=e5711c31272e421e1399fa08e0c163a5f869dade
 export WANDB_MODE=online
 export WANDB_START_METHOD=thread
 export WANDB_SERVICE_WAIT=1200

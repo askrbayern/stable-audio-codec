@@ -21,6 +21,17 @@ from .utils import Stereo, Mono, PhaseFlipper, PadCrop_Normalized_T, VolumeNorm
 
 AUDIO_KEYS = ("flac", "wav", "mp3", "m4a", "ogg", "opus")
 
+# optional verbose timings for dataset startup
+LOG_DATASET_TIMINGS = os.environ.get("LOG_DATASET_TIMINGS", "0") == "1"
+
+# ============ robust path helper ============
+def _is_path_under(path_str: str, root_str: str) -> bool:
+    try:
+        return os.path.commonpath([os.path.abspath(path_str), os.path.abspath(root_str)]) == os.path.abspath(root_str)
+    except Exception:
+        return path_str.startswith(root_str)
+# ===========================================
+
 # fast_scandir implementation by Scott Hawley originally in https://github.com/zqevans/audio-diffusion/blob/main/dataset/dataset.py
 
 def fast_scandir(
@@ -101,6 +112,26 @@ def get_audio_filenames(
     if type(paths) is str:
         paths = [paths]
     for path in paths:               # get a list of relevant filenames
+        # Prefer a precomputed file list if available to avoid crawling
+        filelist_path = os.path.join(path, "filelist.txt")
+        if os.path.exists(filelist_path):
+            try:
+                with open(filelist_path, "r") as f:
+                    for line in f:
+                        rel = line.strip()
+                        if not rel:
+                            continue
+                        full = rel if os.path.isabs(rel) else os.path.join(path, rel)
+                        # Skip macOS artifacts if present in list
+                        base = os.path.basename(full)
+                        if base.startswith("._") or "__MACOSX" in full:
+                            continue
+                        filenames.append(full)
+                continue
+            except Exception:
+                # Fall back to scanning if filelist parsing fails
+                pass
+
         if keywords is not None:
             subfolders, files = keyword_scandir(path, exts, keywords)
         else:
@@ -136,11 +167,21 @@ class LocalDatasetConfig:
         self,
         id: str,
         path: str,
-        custom_metadata_fn: Optional[Callable[[str], str]] = None
+        custom_metadata_fn: Optional[Callable[[str], str]] = None,
+        # =========================
+        domain: Optional[str] = None,
+        assume_full_band: bool = False,
+        # =========================
     ):
         self.id = id
         self.path = path
         self.custom_metadata_fn = custom_metadata_fn
+        # =========================
+        # 'music' | 'speech' | 'env'
+        self.domain = domain
+        # true > treat as full band True, treat this source as full-band regardless of probed sample rate
+        self.assume_full_band = assume_full_band
+        # =========================
 
 class SampleDataset(torch.utils.data.Dataset):
     def __init__(
@@ -150,7 +191,11 @@ class SampleDataset(torch.utils.data.Dataset):
         sample_rate=48000, 
         keywords=None, 
         random_crop=True,
-        force_channels="stereo"
+        force_channels="stereo",
+        # =========================
+        volume_norm: bool = False,
+        volume_norm_param = [-24, 0]
+        # =========================
     ):
         super().__init__()
         self.filenames = []
@@ -160,6 +205,11 @@ class SampleDataset(torch.utils.data.Dataset):
         )
 
         self.root_paths = []
+        # =========================
+        # root path -> domain/assumptions (for balancing)
+        self.root_to_domain = {}
+        self.root_to_assume_full_band = {}
+        # =========================
 
         self.pad_crop = PadCrop_Normalized_T(sample_size, sample_rate, randomize=random_crop)
 
@@ -171,16 +221,49 @@ class SampleDataset(torch.utils.data.Dataset):
         )
 
         self.sr = sample_rate
+        # =========================
+        self.volume_norm = volume_norm
+        self.volume_norm_param = volume_norm_param
+        # =========================
+
+        # Now that sr/volume flags exist, define augmentations
+        # self.augs = torch.nn.Sequential(
+        #     VolumeNorm(self.volume_norm_param, self.sr) if self.volume_norm else torch.nn.Identity(),
+        #     PhaseFlipper()
+        # )
 
         self.custom_metadata_fns = {}
 
         for config in configs:
             self.root_paths.append(config.path)
-            self.filenames.extend(get_audio_filenames(config.path, keywords))
+            start_t = time.time() if LOG_DATASET_TIMINGS else 0.0
+            local_files = get_audio_filenames(config.path, keywords)
+            self.filenames.extend(local_files)
+            if LOG_DATASET_TIMINGS:
+                try:
+                    print(f"[Dataset] scan root={config.path} id={config.id} files={len(local_files)} time={time.time()-start_t:.1f}s")
+                except Exception:
+                    print(f"[Dataset] scan root={config.path} files={len(local_files)} time={time.time()-start_t:.1f}s")
             if config.custom_metadata_fn is not None:
                 self.custom_metadata_fns[config.path] = config.custom_metadata_fn
+            if getattr(config, 'domain', None) is not None:
+                self.root_to_domain[config.path] = config.domain
+            if getattr(config, 'assume_full_band', None) is not None:
+                self.root_to_assume_full_band[config.path] = bool(config.assume_full_band)
 
         print(f'Found {len(self.filenames)} files')
+        if LOG_DATASET_TIMINGS:
+            print(f"[Dataset] total_files={len(self.filenames)}")
+
+        # ===========================
+        # Precompute original sample rates for balancing and metadata
+        self._orig_sr_by_index = [None] * len(self.filenames)
+        self._is_full_band_by_index = [False] * len(self.filenames)
+
+        for idx, fname in enumerate(self.filenames):
+            assume_full = any(_is_path_under(fname, root) and self.root_to_assume_full_band.get(root, False) for root in self.root_paths)
+            self._is_full_band_by_index[idx] = bool(assume_full)
+        # ===========================
 
     def load_file(self, filename):
         ext = filename.split(".")[-1]
@@ -191,16 +274,37 @@ class SampleDataset(torch.utils.data.Dataset):
             resample_tf = T.Resample(in_sr, self.sr)
             audio = resample_tf(audio)
 
-        return audio
+        return audio, in_sr
 
     def __len__(self):
         return len(self.filenames)
+
+    # ============ rank-aware/audit support helper ============
+    def get_info(self, idx):
+        """Lightweight metadata accessor used by balance audit.
+        Does not load audio; reconstructs info from precomputed fields.
+        """
+        audio_filename = self.filenames[idx]
+        info = {
+            "path": audio_filename,
+            "sample_rate": self.sr,
+            "is_full_band": self._is_full_band_by_index[idx] if 0 <= idx < len(self._is_full_band_by_index) else False,
+        }
+        # Domain inference from root mapping
+        for root_path in self.root_paths:
+            if _is_path_under(audio_filename, root_path) and root_path in self.root_to_domain:
+                info["domain"] = self.root_to_domain[root_path]
+                break
+        return info
+    # =========================================================
 
     def __getitem__(self, idx):
         audio_filename = self.filenames[idx]
         try:
             start_time = time.time()
-            audio = self.load_file(audio_filename)
+            # ===========================
+            audio, in_sr = self.load_file(audio_filename)
+            # ===========================
 
             audio, t_start, t_end, seconds_start, seconds_total, padding_mask = self.pad_crop(audio)
 
@@ -223,7 +327,7 @@ class SampleDataset(torch.utils.data.Dataset):
             info["path"] = audio_filename
 
             for root_path in self.root_paths:
-                if root_path in audio_filename:
+                if _is_path_under(audio_filename, root_path):
                     info["relpath"] = path.relpath(audio_filename, root_path)
 
             info["timestamps"] = (t_start, t_end)
@@ -231,6 +335,18 @@ class SampleDataset(torch.utils.data.Dataset):
             info["seconds_total"] = seconds_total
             info["padding_mask"] = padding_mask
             info["sample_rate"] = self.sr
+
+            # ===========================
+            info["original_sample_rate"] = in_sr
+            info["upsampled"] = bool(in_sr is not None and in_sr < self.sr)
+            # domain from source root
+            for root_path in self.root_paths:
+                if _is_path_under(audio_filename, root_path) and root_path in self.root_to_domain:
+                    info["domain"] = self.root_to_domain[root_path]
+                    break
+            # full-band flag based on precomputed probes/assumptions
+            info["is_full_band"] = self._is_full_band_by_index[idx]
+            # ===========================
 
             end_time = time.time()
 
@@ -261,6 +377,164 @@ class SampleDataset(torch.utils.data.Dataset):
         except Exception as e:
             print(f'Couldn\'t load file {audio_filename}: {e}')
             return self[random.randrange(len(self))]
+
+# ======================================================
+class BalancedBatchSampler(torch.utils.data.Sampler[list]):
+    """Batch sampler enforcing per-batch domain balance and at least one full-band item.
+
+    - domains: list[str] like ["music", "speech", "env"]
+    - n_per_domain: computed from batch_size // len(domains), remainder distributed randomly
+    """
+    def __init__(self, dataset: SampleDataset, batch_size: int, domains: list, ensure_full_band_per_batch: bool = True):
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.domains = list(domains)
+        self.ensure_full_band = ensure_full_band_per_batch
+
+        # Build index pools per domain
+        self.domain_to_indices = {d: [] for d in self.domains}
+        self.fullband_indices = []
+        self.domain_fullband = {d: [] for d in self.domains}
+
+        for idx, fname in enumerate(self.dataset.filenames):
+            dom = None
+            for root in self.dataset.root_paths:
+                if _is_path_under(fname, root) and root in self.dataset.root_to_domain:
+                    dom = self.dataset.root_to_domain[root]
+                    break
+            if dom not in self.domain_to_indices:
+                # Unknown domain; skip from balanced sampling
+                continue
+            self.domain_to_indices[dom].append(idx)
+            if self.dataset._is_full_band_by_index[idx]:
+                self.fullband_indices.append(idx)
+                self.domain_fullband[dom].append(idx)
+
+        # ============ rank-aware: slice per rank (DDP) ============
+        self.world_size = 1
+        self.rank = 0
+        try:
+            import torch.distributed as dist  # local import to avoid hard dependency
+            if dist.is_available() and dist.is_initialized():
+                self.world_size = dist.get_world_size()
+                self.rank = dist.get_rank()
+        except Exception:
+            pass
+
+        if self.world_size > 1:
+            # Slice per-domain indices so each rank sees a disjoint subset
+            for d in list(self.domain_to_indices.keys()):
+                idxs = self.domain_to_indices[d]
+                if idxs:
+                    self.domain_to_indices[d] = idxs[self.rank::self.world_size]
+
+            # Slice per-domain fullband pools to match sliced indices
+            for d in list(self.domain_fullband.keys()):
+                idxs = self.domain_fullband[d]
+                if idxs:
+                    allowed = set(self.domain_to_indices[d])
+                    self.domain_fullband[d] = [i for i in idxs if i in allowed]
+
+            # Slice global fullband list to the union of assigned domain pools for this rank
+            allowed_all = set(i for dom in self.domain_to_indices for i in self.domain_to_indices[dom])
+            self.fullband_indices = [i for i in self.fullband_indices if i in allowed_all]
+        # ==========================================================
+
+        # Shuffle domain pools (after slicing)
+        self._reset_iterators()
+
+        # Determine domains that actually have data
+        self.available_domains = [d for d, idxs in self.domain_to_indices.items() if len(idxs) > 0]
+        if not self.available_domains:
+            raise ValueError(
+                f"BalancedBatchSampler: No samples found for any of the requested domains {self.domains}. "
+                f"Check dataset paths and domain assignments."
+            )
+
+        # Derive an epoch length: iterate through the shortest non-empty domain pool
+        min_pool = min(len(self.domain_to_indices[d]) for d in self.available_domains)
+        # Each batch consumes roughly n_per_domain from each available domain
+        n_per_domain = max(1, self.batch_size // max(1, len(self.available_domains)))
+        self._num_batches = max(1, min_pool // n_per_domain)
+        if LOG_DATASET_TIMINGS:
+            try:
+                counts = {d: len(v) for d, v in self.domain_to_indices.items()}
+                print(f"[Sampler] domains={counts} fullband={len(self.fullband_indices)} num_batches={self._num_batches}")
+            except Exception as _:
+                pass
+
+    def _reset_iterators(self):
+        import random
+        self.domain_iters = {}
+        for d, idxs in self.domain_to_indices.items():
+            random.shuffle(idxs)
+            self.domain_iters[d] = iter(idxs)
+
+    def _balanced_pick(self, domain: str, k: int):
+        picked = []
+        for _ in range(k):
+            try:
+                picked.append(next(self.domain_iters[domain]))
+            except StopIteration:
+                # Re-shuffle and restart
+                pool = self.domain_to_indices[domain][:]
+                if not pool:
+                    break
+                import random
+                random.shuffle(pool)
+                self.domain_iters[domain] = iter(pool)
+                picked.append(next(self.domain_iters[domain]))
+        return picked
+
+    def __iter__(self):
+        import random
+        n_domains = len(self.available_domains)
+        while True:
+            batch = []
+            base = self.batch_size // max(1, n_domains)
+            rem = self.batch_size - base * n_domains
+            for d in self.available_domains:
+                batch.extend(self._balanced_pick(d, base))
+            # Distribute remainder
+            if rem > 0:
+                # Allow sampling with replacement when rem > n_domains
+                for _ in range(rem):
+                    d = random.choice(self.available_domains)
+                    batch.extend(self._balanced_pick(d, 1))
+
+            # Ensure batch size
+            if len(batch) < self.batch_size:
+                # fill from any available domain
+                all_indices = [i for dom in self.available_domains for i in self.domain_to_indices[dom]]
+                random.shuffle(all_indices)
+                need = self.batch_size - len(batch)
+                batch.extend(all_indices[:need])
+            elif len(batch) > self.batch_size:
+                batch = batch[:self.batch_size]
+
+            # Ensure at least one full-band sample if requested
+            if self.ensure_full_band and self.fullband_indices:
+                if not any(self.dataset._is_full_band_by_index[i] for i in batch):
+                    # Replace one element with a full-band index, prefer same domain if possible
+                    repl_ix = random.randrange(len(batch))
+                    dom_repl = None
+                    # Determine domain of the replaced item
+                    fname = self.dataset.filenames[batch[repl_ix]]
+                    for root in self.dataset.root_paths:
+                        if _is_path_under(fname, root) and root in self.dataset.root_to_domain:
+                            dom_repl = self.dataset.root_to_domain[root]
+                            break
+                    if dom_repl and self.domain_fullband.get(dom_repl):
+                        batch[repl_ix] = random.choice(self.domain_fullband[dom_repl])
+                    else:
+                        batch[repl_ix] = random.choice(self.fullband_indices)
+
+            yield batch
+
+    def __len__(self):
+        return self._num_batches
+        
+# ======================================================
 
 class PreEncodedDataset(torch.utils.data.Dataset):
     def __init__(
@@ -833,11 +1107,17 @@ def create_dataloader_from_config(dataset_config, batch_size, sample_size, sampl
 
                 custom_metadata_fn = metadata_module.get_custom_metadata
 
+            # Propagate domain and assume_full_band from JSON so balancing works
+            domain = audio_dir_config.get("domain", None)
+            assume_full_band = bool(audio_dir_config.get("assume_full_band", False))
+
             configs.append(
                 LocalDatasetConfig(
                     id=audio_dir_config["id"],
                     path=audio_dir_path,
-                    custom_metadata_fn=custom_metadata_fn
+                    custom_metadata_fn=custom_metadata_fn,
+                    domain=domain,
+                    assume_full_band=assume_full_band,
                 )
             )
 
@@ -846,11 +1126,44 @@ def create_dataloader_from_config(dataset_config, batch_size, sample_size, sampl
             sample_rate=sample_rate,
             sample_size=sample_size,
             random_crop=dataset_config.get("random_crop", True),
-            force_channels=force_channels
+            force_channels=force_channels,
+            volume_norm=dataset_config.get("volume_norm", False),
+            volume_norm_param=dataset_config.get("volume_norm_param", [-24, 0])
         )
 
-        return torch.utils.data.DataLoader(train_set, batch_size, shuffle=shuffle,
-                                num_workers=num_workers, persistent_workers=True, pin_memory=True, drop_last=dataset_config.get("drop_last", True), collate_fn=collation_fn)
+
+        # ======================================================
+        # return torch.utils.data.DataLoader(train_set, batch_size, shuffle=shuffle,
+        #                         num_workers=num_workers, persistent_workers=True, pin_memory=True, drop_last=dataset_config.
+        #                         get("drop_last", True), collate_fn=collation_fn)
+
+        # Optional: balanced per-batch domain sampling and full-band guarantee
+        balanced = dataset_config.get("balanced_domains", False)
+        if balanced:
+            domains = dataset_config.get("domains", ["music", "speech", "env"])
+            ensure_full_band = dataset_config.get("ensure_full_band_per_batch", True)
+            batch_sampler = BalancedBatchSampler(train_set, batch_size, domains, ensure_full_band)
+            return torch.utils.data.DataLoader(
+                train_set,
+                batch_sampler=batch_sampler,
+                num_workers=num_workers,
+                persistent_workers=True,
+                pin_memory=True,
+                collate_fn=collation_fn,
+            )
+        else:
+            return torch.utils.data.DataLoader(
+                train_set,
+                batch_size,
+                shuffle=shuffle,
+                num_workers=num_workers,
+                persistent_workers=True,
+                pin_memory=True,
+                drop_last=dataset_config.get("drop_last", True),
+                collate_fn=collation_fn,
+            )
+
+        # ======================================================
 
     elif dataset_type == "pre_encoded":
 
@@ -899,8 +1212,7 @@ def create_dataloader_from_config(dataset_config, batch_size, sample_size, sampl
             latent_extension=latent_extension
         )
 
-        return torch.utils.data.DataLoader(train_set, batch_size, shuffle=shuffle,
-                                num_workers=num_workers, persistent_workers=True, pin_memory=True, drop_last=dataset_config.get("drop_last", True), collate_fn=collation_fn)
+        return torch.utils.data.DataLoader(train_set, batch_size, shuffle=shuffle, num_workers=num_workers, persistent_workers=True, pin_memory=True, drop_last=dataset_config.get("drop_last", True), collate_fn=collation_fn)
 
     elif dataset_type in ["s3", "wds"]: # Support "s3" type for backwards compatibility
         wds_configs = []

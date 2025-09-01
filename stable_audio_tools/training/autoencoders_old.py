@@ -512,20 +512,15 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
             else:
                 sched_gen = lr_schedulers
 
-        # ============
-        # Use internal counter instead of global_step for reliable alternating
-        if not hasattr(self, '_internal_step_counter'):
-            self._internal_step_counter = 0
-
+        # Train the discriminator
         use_disc = (
             self.use_disc
-            and self._internal_step_counter % 2 == 1  # only use discriminator every other step
+            and self.global_step % 2
+            # Check warmup mode and if it is time to use discriminator.
             and (
                 (self.warmup_mode == "full" and self.warmed_up)
                 or self.warmup_mode == "adv")
         )
-        # ============
-        
         if use_disc:
             loss, losses = self.losses_disc(loss_info)
 
@@ -559,10 +554,10 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
                 p = torch.clamp_min(
                     laplace_cdf(lm_latents + 0.5, mu, b)
                     - laplace_cdf(lm_latents - 0.5, mu, b),
-                    min=1e-6 # new clip
+                    min=2**-24 
                 )
 
-                rate = torch.clamp(-torch.log2(p), max=12) # new clip
+                rate = -torch.log2(p)
                 lm_loss = rate.mean()
                 losses['lm_loss'] = lm_loss
                 loss += lm_loss
@@ -577,38 +572,40 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
                     self.autoencoder.sample_rate / self.autoencoder.downsampling_ratio
                 )
                 log_dict['train/bits_per_second'] = bits_per_second.item()
+                # log_dict['train/lm_loss'] = lm_loss.item()
                 log_dict['train/lm_var'] = (2 * b.pow(2)).mean().item()
-
-                # log_dict['train/lm_lr'] = opt_lm.param_groups[0]['lr']
-                log_dict['train/lm_proj_norm'] = self.lm.proj.weight.norm().detach().item()
+                # Diagnostics for resume consistency
+                if self.use_disc:
+                    try:
+                        log_dict['train/lm_lr'] = opt_lm.param_groups[0]['lr']
+                    except Exception:
+                        pass
+                # Track LM head magnitude to detect resets
+                try:
+                    log_dict['train/lm_proj_norm'] = self.lm.proj.weight.norm().detach().item()
+                except Exception:
+                    pass
                 # log_dict['train/current_lm_weight'] = current_lm_weight
 
-                # Additional diagnostics
+                # Additional diagnostics (visualization-only)
                 with torch.no_grad():
+                    # Scale diagnostics
                     log_dict['train/lm_b_mean'] = b.mean().item()
+                    # Alignment diagnostics (use raw latents, not gradient-scaled)
                     latents_raw = loss_info.get("latents", lm_latents)
                     log_dict['train/mu_to_latents'] = (mu - latents_raw).abs().mean().item()
+                    # LM's absolute alignment to integer grid
                     log_dict['train/mu_to_int'] = (mu - mu.round()).abs().mean().item()
 
             if self.use_ema:
                 self.autoencoder_ema.update()
 
             opt_gen.zero_grad()
-            if self.lm is not None:
+            if self.lm is not None: # empty grads for LM
                 opt_lm.zero_grad()
-
             self.manual_backward(loss)
             if self.clip_grad_norm > 0.0:
-                gen_total_norm = torch.nn.utils.clip_grad_norm_(self.autoencoder.parameters(), self.clip_grad_norm)
-                if self.lm is not None:
-                    lm_total_norm = torch.nn.utils.clip_grad_norm_(self.lm.parameters(), self.clip_grad_norm)
-                else:
-                    lm_total_norm = torch.tensor(0.0, device=loss.device)
-                # lightweight logging of when clipping triggers (only if exceeded)
-                if torch.isfinite(gen_total_norm) and gen_total_norm > self.clip_grad_norm:
-                    log_dict['train/gen_grad_clip'] = float(gen_total_norm.detach().item())
-                if torch.isfinite(lm_total_norm) and lm_total_norm > self.clip_grad_norm:
-                    log_dict['train/lm_grad_clip'] = float(lm_total_norm.detach().item())
+                torch.nn.utils.clip_grad_norm_(self.autoencoder.parameters(), self.clip_grad_norm)
             opt_gen.step()
             if self.lm is not None: # step LM opt
                 opt_lm.step()
@@ -626,68 +623,8 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
             log_dict[f'train/{loss_name}'] = loss_value.detach().item()
 
         self.log_dict(log_dict, prog_bar=True, on_step=True)
-        
-        # ============
-        # Increment internal counter at the end of each training_step
-        self._internal_step_counter += 1
-        # ============
 
         return loss
-
-    # ==================== save step counter and EMA state ====================
-    def on_save_checkpoint(self, checkpoint):
-        if hasattr(self, '_internal_step_counter'):
-            checkpoint['_internal_step_counter'] = self._internal_step_counter
-        
-        if self.use_ema and self.autoencoder_ema is not None:
-            checkpoint['autoencoder_ema_state_dict'] = self.autoencoder_ema.ema_model.state_dict()
-            checkpoint['autoencoder_ema_object_state'] = self.autoencoder_ema.state_dict()
-        
-        if getattr(self, 'lm', None) is not None:
-            try:
-                checkpoint['lm_state_dict'] = self.lm.state_dict()
-                checkpoint['lm_param_names'] = [name for name, _ in self.lm.named_parameters()]
-                if hasattr(self, 'lm_config') and self.lm_config is not None:
-                    checkpoint['lm_config'] = self.lm_config
-                print(f"[Checkpoint] Saved LM state dict with {len(checkpoint['lm_state_dict'])} parameters")
-            except Exception as e:
-                print(f"[Checkpoint] Failed to save LM state: {e}")
-                pass
-
-    def on_load_checkpoint(self, checkpoint):
-        if '_internal_step_counter' in checkpoint:
-            self._internal_step_counter = checkpoint['_internal_step_counter']
-        
-        if self.use_ema and self.autoencoder_ema is not None:
-            if 'autoencoder_ema_state_dict' in checkpoint:
-                self.autoencoder_ema.ema_model.load_state_dict(checkpoint['autoencoder_ema_state_dict'])
-            if 'autoencoder_ema_object_state' in checkpoint:
-                self.autoencoder_ema.load_state_dict(checkpoint['autoencoder_ema_object_state'])
-        
-        self._lm_param_order_mismatch = False
-        if getattr(self, 'lm', None) is not None:
-            if 'lm_state_dict' in checkpoint:
-                try:
-                    self.lm.load_state_dict(checkpoint['lm_state_dict'])
-                    print(f"[Checkpoint] Successfully loaded LM state dict with {len(checkpoint['lm_state_dict'])} parameters")
-                except Exception as e:
-                    print(f"[Checkpoint] Failed to load LM state dict: {e}")
-                    print("[Checkpoint] LM will start with random initialization")
-            else:
-                print("[Checkpoint] No LM state dict found in checkpoint, LM will start with random initialization")
-            
-            if 'lm_param_names' in checkpoint:
-                try:
-                    saved = checkpoint.get('lm_param_names', None)
-                    current = [name for name, _ in self.lm.named_parameters()]
-                    if isinstance(saved, list) and saved != current:
-                        self._lm_param_order_mismatch = True
-                        print('[Warning] LM parameter order mismatch detected between checkpoint and current model.\n'
-                              'Optimizer state alignment for LM may be invalid. Consider reinitializing LM optimizer.')
-                except Exception as _e:
-                    pass
-
-    # ==================== save step counter and EMA state ====================
 
     def export_model(self, path, use_safetensors=False):
         if self.autoencoder_ema is not None:

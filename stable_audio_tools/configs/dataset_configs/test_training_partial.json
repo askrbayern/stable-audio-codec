@@ -1,0 +1,13 @@
+{
+  "dataset_type": "audio_dir",
+  "random_crop": true,
+  "drop_last": true,
+  "balanced_domains": true,
+  "domains": ["music", "speech", "env"],
+  "ensure_full_band_per_batch": true,
+  "volume_norm": true,
+  "volume_norm_param": [-24, 0],
+  "datasets": [
+    { "id": "dns4",    "path": "/itet-stor/feigao/net_scratch/datasets/dns_challenge_4/clean_fullband/extracted",     "domain": "speech", "assume_full_band": true }
+  ]
+}

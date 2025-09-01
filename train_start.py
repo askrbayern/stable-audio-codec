@@ -3,7 +3,6 @@
 import os
 import json
 import argparse
-import math
 import glob
 
 import torch
@@ -17,48 +16,45 @@ from stable_audio_tools.data.dataset import create_dataloader_from_config
 from stable_audio_tools.models import create_model_from_config
 from stable_audio_tools.training.factory import create_training_wrapper_from_config
 
-class ExceptionCallback(pl.Callback):
-    def on_exception(self, trainer, module, err):
-        print(f"{type(err).__name__}: {err}")
 
-class ModelConfigEmbedderCallback(pl.Callback):
-    def __init__(self, model_config):
-        self.model_config = model_config
-
-    def on_save_checkpoint(self, trainer, pl_module, checkpoint):
-        checkpoint["model_config"] = self.model_config
-
-class OptimizerStateCallback(pl.Callback):
-    """Force-save optimizer states to avoid empty optimizer state issues when resuming.
-    """
-    def on_save_checkpoint(self, trainer, pl_module, checkpoint):
-        try:
-            if hasattr(trainer, "optimizers") and trainer.optimizers:
-                checkpoint["custom_optimizer_states"] = [opt.state_dict() for opt in trainer.optimizers]
-                print(f"OptimizerStateCallback: Saved {len(trainer.optimizers)} optimizer states")
-        except Exception as e:
-            print(f"OptimizerStateCallback on_save_checkpoint warning: {e}")
-
-    def on_load_checkpoint(self, trainer, pl_module, checkpoint):
-        try:
-            if "custom_optimizer_states" in checkpoint:
-                custom_states = checkpoint["custom_optimizer_states"]
-                print(f"OptimizerStateCallback: Found {len(custom_states)} custom optimizer states")
+# class ExceptionCallback(pl.Callback):
+#     def on_exception(self, trainer, module, err):
+#         print(f"{type(err).__name__}: {err}")
+# class ModelConfigEmbedderCallback(pl.Callback):
+#     def __init__(self, model_config):
+#         self.model_config = model_config
+#     def on_save_checkpoint(self, trainer, pl_module, checkpoint):
+#         checkpoint["model_config"] = self.model_config
+# class OptimizerStateCallback(pl.Callback):
+#     """Force-save optimizer states to avoid empty optimizer state issues when resuming.
+#     """
+#     def on_save_checkpoint(self, trainer, pl_module, checkpoint):
+#         try:
+#             if hasattr(trainer, "optimizers") and trainer.optimizers:
+#                 checkpoint["custom_optimizer_states"] = [opt.state_dict() for opt in trainer.optimizers]
+#                 print(f"OptimizerStateCallback: Saved {len(trainer.optimizers)} optimizer states")
+#         except Exception as e:
+#             print(f"OptimizerStateCallback on_save_checkpoint warning: {e}")
+#     def on_load_checkpoint(self, trainer, pl_module, checkpoint):
+#         try:
+#             if "custom_optimizer_states" in checkpoint:
+#                 custom_states = checkpoint["custom_optimizer_states"]
+#                 print(f"OptimizerStateCallback: Found {len(custom_states)} custom optimizer states")
                 
-                # Ensure trainer has optimizers before loading
-                if hasattr(trainer, "optimizers") and trainer.optimizers:
-                    for i, opt_state in enumerate(custom_states):
-                        if i < len(trainer.optimizers):
-                            trainer.optimizers[i].load_state_dict(opt_state)
-                            print(f"OptimizerStateCallback: Loaded optimizer {i} state")
-                        else:
-                            print(f"OptimizerStateCallback: Warning - optimizer {i} state found but no matching optimizer")
-                else:
-                    print("OptimizerStateCallback: Warning - no trainer.optimizers available during load")
-            else:
-                print("OptimizerStateCallback: No custom_optimizer_states found in checkpoint")
-        except Exception as e:
-            print(f"OptimizerStateCallback on_load_checkpoint warning: {e}")
+#                 # Ensure trainer has optimizers before loading
+#                 if hasattr(trainer, "optimizers") and trainer.optimizers:
+#                     for i, opt_state in enumerate(custom_states):
+#                         if i < len(trainer.optimizers):
+#                             trainer.optimizers[i].load_state_dict(opt_state)
+#                             print(f"OptimizerStateCallback: Loaded optimizer {i} state")
+#                         else:
+#                             print(f"OptimizerStateCallback: Warning - optimizer {i} state found but no matching optimizer")
+#                 else:
+#                     print("OptimizerStateCallback: Warning - no trainer.optimizers available during load")
+#             else:
+#                 print("OptimizerStateCallback: No custom_optimizer_states found in checkpoint")
+#         except Exception as e:
+#             print(f"OptimizerStateCallback on_load_checkpoint warning: {e}")
 
 def load_audio(path: str, sample_rate: int) -> torch.Tensor:
     audio, sr = torchaudio.load(path)
@@ -110,7 +106,9 @@ def recon(autoencoder, input_path: str, output_path: str, device: torch.device, 
         return
     
     autoencoder = autoencoder.to(device)
+    was_training = autoencoder.training
     autoencoder.eval()
+    
     x = load_audio(input_path, sample_rate).to(device)
     with torch.no_grad():
         latents, _ = autoencoder.encode(x, return_info=True)
@@ -118,6 +116,8 @@ def recon(autoencoder, input_path: str, output_path: str, device: torch.device, 
         # Check latents for issues
         if torch.isnan(latents).any() or torch.isinf(latents).any():
             print(f"Warning: NaN/Inf in latents, skipping reconstruction for {input_path}")
+            if was_training:
+                autoencoder.train()
             return
             
         y = autoencoder.decode(latents)
@@ -126,27 +126,29 @@ def recon(autoencoder, input_path: str, output_path: str, device: torch.device, 
         if torch.isnan(y).any() or torch.isinf(y).any():
             print(f"Warning: NaN/Inf in decoded output, attempting to fix")
             y = torch.nan_to_num(y, nan=0.0, posinf=1.0, neginf=-1.0)
-            
+    
+    if was_training:
+        autoencoder.train()
+
+        
     y = y.clamp(-1, 1).cpu()
     save_audio(y, output_path, sample_rate)
 
-def laplace_cdf(x, expectation, scale):
-    shifted_x = x - expectation
-    return 0.5 - 0.5 * (shifted_x).sign() * torch.expm1(-(shifted_x).abs() / scale)
+ 
 
-class AfterLoadSaveCallback(pl.Callback):
-    """Save a checkpoint immediately after loading for debugging."""
-    def __init__(self, checkpoint_dir: str, enabled: bool = False):
-        self.checkpoint_dir = checkpoint_dir
-        self.enabled = enabled
-        self.saved = False
+# class AfterLoadSaveCallback(pl.Callback):
+#     """Save a checkpoint immediately after loading for debugging."""
+#     def __init__(self, checkpoint_dir: str, enabled: bool = False):
+#         self.checkpoint_dir = checkpoint_dir
+#         self.enabled = enabled
+#         self.saved = False
     
-    def on_train_start(self, trainer, pl_module):
-        if self.enabled and not self.saved:
-            after_load_path = os.path.join(self.checkpoint_dir, "after_load.ckpt")
-            trainer.save_checkpoint(after_load_path)
-            print(f"[AfterLoadSave] Saved after_load checkpoint to: {after_load_path}")
-            self.saved = True
+#     def on_train_start(self, trainer, pl_module):
+#         if self.enabled and not self.saved:
+#             after_load_path = os.path.join(self.checkpoint_dir, "after_load.ckpt")
+#             trainer.save_checkpoint(after_load_path)
+#             print(f"[AfterLoadSave] Saved after_load checkpoint to: {after_load_path}")
+#             self.saved = True
 
 class EpochReconCallback(pl.Callback):
     def __init__(self, input_dir: str, output_dir: str, sample_rate: int, device: torch.device):
@@ -232,12 +234,11 @@ def main():
         autoencoder = autoencoder.to(device).eval()
         sample_rate = model_cfg.get("sample_rate")
         # Collect audio files from input_dir
-        from glob import glob
         # recursively collect audio files under input_dir
         audio_patterns = ["**/*.wav", "**/*.mp3", "**/*.flac", "**/*.ogg"]
         audio_files = []
         for pat in audio_patterns:
-            audio_files.extend(glob(os.path.join(args.input_dir, pat), recursive=True))
+            audio_files.extend(glob.glob(os.path.join(args.input_dir, pat), recursive=True))
         audio_files = sorted(audio_files)[: args.inspect_count]
         # Create inspect output folder
         inspect_dir = os.path.join(args.output_dir, "inspect")
@@ -298,7 +299,7 @@ def main():
     data_cfg = {
         "dataset_type": "audio_dir",
         "datasets": [{"id": "train", "path": args.data_dir}],
-        "random_crop": False,
+        "random_crop": True,
         "drop_last": True
     }
     sample_rate = model_cfg["sample_rate"]
@@ -345,10 +346,10 @@ def main():
     )
     
     # After load save callback - only enabled when resuming
-    after_load_callback = AfterLoadSaveCallback(
-        checkpoint_dir=checkpoint_dir,
-        enabled=bool(args.ckpt_path and os.path.exists(args.ckpt_path))
-    )
+    # after_load_callback = AfterLoadSaveCallback(
+    #     checkpoint_dir=checkpoint_dir,
+    #     enabled=bool(args.ckpt_path and os.path.exists(args.ckpt_path))
+    # )
 
     # 6. Training - simplified callbacks, keep only essential ones
     # ============
@@ -362,7 +363,8 @@ def main():
         max_epochs=args.max_epochs,
         log_every_n_steps=50,
         logger=wandb_logger,
-        callbacks=[checkpoint_callback, recon_callback, after_load_callback],
+        # callbacks=[checkpoint_callback, recon_callback, after_load_callback],
+        callbacks=[checkpoint_callback, recon_callback],
         enable_checkpointing=True,
         default_root_dir=args.output_dir
     )

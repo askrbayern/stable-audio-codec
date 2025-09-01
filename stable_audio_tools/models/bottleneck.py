@@ -34,8 +34,13 @@ class DiscreteBottleneck(Bottleneck):
 
 class RoundBottleneck(Bottleneck):
     """
-    only STE round, no clamp, no codebook
-    return float integer latents (optionally to Laplace LM)
+    Rounding bottleneck with optional training-time dither.
+
+    Behavior:
+    - Train mode:
+        * If dither=True, add uniform noise in [-0.5, 0.5) and DO NOT round.
+        * If dither=False, apply STE rounding.
+    - Eval mode: always hard-round.
     """
     def __init__(self, latent_dim: int = 32, dither: bool = False):
         super().__init__(is_discrete=False)
@@ -46,10 +51,15 @@ class RoundBottleneck(Bottleneck):
         # x: [B, C, T]
         assert x.shape[1] == self.latent_dim, f"Expected channels={self.latent_dim}, got {x.shape[1]}"
 
-        if self.dither and self.training:  # Only dither during training
-            x = x + (torch.rand_like(x) - 0.5)
-
-        q = round_ste(x)          # forward round, gradient pass
+        # Train-time: either (dither only) or (STE rounding), controlled by dither flag
+        if self.training:
+            if self.dither:
+                x = x + (torch.rand_like(x) - 0.5)
+                q = x
+            else:
+                q = round_ste(x)
+        else:
+            q = x.round()
         if return_info:
             return q, {}          # no tokens in info
         return q

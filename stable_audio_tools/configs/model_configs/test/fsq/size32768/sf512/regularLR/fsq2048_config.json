@@ -1,6 +1,6 @@
 {
   "model_type": "autoencoder",
-  "sample_size": 16384,
+  "sample_size": 32768,
   "sample_rate": 44100,
   "audio_channels": 2,
   "model": {
@@ -18,8 +18,8 @@
         "strides": [
           2,
           4,
-          4,
-          4
+          8,
+          8
         ],
         "latent_dim": 2048,
         "use_snake": true
@@ -39,8 +39,8 @@
         "strides": [
           2,
           4,
-          4,
-          4
+          8,
+          8
         ],
         "latent_dim": 2048,
         "use_snake": true,
@@ -55,7 +55,7 @@
       }
     },
     "latent_dim": 2048,
-    "downsampling_ratio": 128,
+    "downsampling_ratio": 512,
     "io_channels": 2,
     "lm": {
       "backbone": {
@@ -65,21 +65,30 @@
       "optimizer": {
         "type": "AdamW",
         "config": {
-          "lr": 4e-07,
+          "lr": 4e-06,
           "betas": [
             0.8,
             0.99
           ],
           "weight_decay": 0.001
         }
+      },
+      "scheduler": {
+        "type": "InverseLR",
+        "config": {
+          "inv_gamma": 200000,
+          "power": 0.5,
+          "warmup": 0.999
+        }
       }
     },
     "lm_weight": 0.5
   },
   "training": {
-    "learning_rate": 1.5e-05,
+    "learning_rate": 1.5e-04,
     "warmup_steps": 0,
     "use_ema": true,
+    "clip_grad_norm": 0,
     "optimizer_configs": {
       "autoencoder": {
         "optimizer": {
@@ -89,7 +98,7 @@
               0.8,
               0.99
             ],
-            "lr": 1.5e-05,
+            "lr": 1.5e-04,
             "weight_decay": 0.001
           }
         },
@@ -110,7 +119,7 @@
               0.8,
               0.99
             ],
-            "lr": 0.00003,
+            "lr": 0.0003,
             "weight_decay": 0.001
           }
         },

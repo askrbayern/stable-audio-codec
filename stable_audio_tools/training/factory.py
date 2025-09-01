@@ -62,6 +62,7 @@ def create_training_wrapper_from_config(model_config, model):
             # ========== need to return lm as well ==========
             lm_config=lm_cfg,
             lm_weight=lm_weight,
+            clip_grad_norm=training_config.get("clip_grad_norm", 0.0),
             # ===============================================
         )
     elif model_type == 'diffusion_uncond':
