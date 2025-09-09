@@ -223,6 +223,7 @@ def main():
     parser.add_argument("--wandb-project", type=str, default="stable_audio_tools")
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--ckpt-path", type=str, default=None)
+    parser.add_argument("--drop-lm", action="store_true", help="If set with --ckpt-path, drop LM weights and states from checkpoint before resuming")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -302,6 +303,41 @@ def main():
     checkpoint_dir = os.path.join(args.output_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
+    # If resuming but dropping LM, sanitize checkpoint by removing LM weights and LM-specific states
+    ckpt_path_to_use = args.ckpt_path if args.ckpt_path else None
+    weights_only_resume = False
+    if args.drop_lm and ckpt_path_to_use and os.path.exists(ckpt_path_to_use):
+        print(f"[Stage] drop-lm enabled: sanitizing checkpoint {ckpt_path_to_use}")
+        ckpt = torch.load(ckpt_path_to_use, map_location="cpu")
+        # Strip lm.* from main state_dict and DO NOT inject any LM weights
+        # so that the current model's LM remains randomly initialized.
+        sd = ckpt.get("state_dict", {})
+        if isinstance(sd, dict):
+            lm_old_keys = [k for k in sd.keys() if k.startswith("lm.")]
+            if lm_old_keys:
+                print(f"[Stage] Removing {len(lm_old_keys)} 'lm.*' weights from checkpoint state_dict (LM will stay random)")
+            sd_clean = {k: v for k, v in sd.items() if not k.startswith("lm.")}
+            ckpt["state_dict"] = sd_clean
+        # Remove any separately saved LM dicts/metadata so on_load_checkpoint treats LM as fresh
+        if "lm_state_dict" in ckpt:
+            print("[Stage] Removing 'lm_state_dict' from checkpoint")
+            ckpt.pop("lm_state_dict", None)
+        if "lm_param_names" in ckpt:
+            ckpt.pop("lm_param_names", None)
+        # Optimizer/scheduler states may reference old LM params — drop them to avoid mismatch
+        if "optimizer_states" in ckpt:
+            print("[Stage] Dropping optimizer_states to avoid LM optimizer mismatch")
+            ckpt.pop("optimizer_states", None)
+        if "lr_schedulers" in ckpt:
+            ckpt.pop("lr_schedulers", None)
+
+        sanitized_path = os.path.join(checkpoint_dir, "last_dropLM.ckpt")
+        torch.save(ckpt, sanitized_path)
+        ckpt_path_to_use = sanitized_path
+        print(f"[Stage] Wrote sanitized checkpoint to {sanitized_path}")
+        # We will load weights manually to avoid optimizer/scheduler restore
+        weights_only_resume = True
+
     # Save best-by-metric
     checkpoint_callback_best = ModelCheckpoint(
         dirpath=checkpoint_dir,
@@ -330,6 +366,30 @@ def main():
         every_n_epochs=args.recon_every_epochs,
     )
 
+    # If we created a sanitized checkpoint and intend to avoid restoring optimizers/schedulers,
+    # load weights manually and clear ckpt_path_to_use so Lightning won't try to restore trainer state.
+    if weights_only_resume and ckpt_path_to_use and os.path.exists(ckpt_path_to_use):
+        try:
+            print(f"[Stage] Loading weights only from {ckpt_path_to_use} (no optimizer/scheduler restore)")
+            ckpt = torch.load(ckpt_path_to_use, map_location="cpu")
+            state_dict = ckpt.get("state_dict", {})
+            missing, unexpected = wrapper.load_state_dict(state_dict, strict=False)
+            if missing:
+                print(f"[Stage] Missing keys while loading: {len(missing)} (ok) e.g. {missing[:5]}")
+            if unexpected:
+                print(f"[Stage] Unexpected keys while loading: {len(unexpected)} e.g. {unexpected[:5]}")
+            # Restore EMA if present
+            if getattr(wrapper, 'use_ema', False) and getattr(wrapper, 'autoencoder_ema', None) is not None:
+                if 'autoencoder_ema_state_dict' in ckpt:
+                    wrapper.autoencoder_ema.ema_model.load_state_dict(ckpt['autoencoder_ema_state_dict'])
+                if 'autoencoder_ema_object_state' in ckpt:
+                    wrapper.autoencoder_ema.load_state_dict(ckpt['autoencoder_ema_object_state'])
+            # Prevent PL from restoring training state
+            ckpt_path_to_use = None
+        except Exception as e:
+            print(f"[Stage] Weights-only load failed: {e}. Proceeding without resume.")
+            ckpt_path_to_use = None
+
     t4 = time.time()
     trainer = pl.Trainer(
         accelerator=args.accelerator,
@@ -348,7 +408,7 @@ def main():
     )
     print(f"[Stage] Trainer created in {time.time()-t4:.2f}s", flush=True)
 
-    trainer.fit(wrapper, train_dl, ckpt_path=args.ckpt_path if args.ckpt_path else None)
+    trainer.fit(wrapper, train_dl, ckpt_path=ckpt_path_to_use)
 
 
 if __name__ == "__main__":

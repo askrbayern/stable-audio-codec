@@ -3,13 +3,14 @@
 #SBATCH --output=/itet-stor/feigao/net_scratch/logs/A100_%j.out
 #SBATCH --error=/itet-stor/feigao/net_scratch/logs/A100_%j.err
 #SBATCH --nodelist=tikgpu10
-#SBATCH --gres=gpu:a100_80gb:8
-#SBATCH --cpus-per-task=70
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=35
 #SBATCH --mem=128G
-#SBATCH --time=12:00:00
+#SBATCH --time=48:00:00
 #SBATCH --mail-type=ALL
 
 set -e
+# SBATCH --nodelist=tikgpu10
 # SBATCH --gres=gpu:geforce_rtx_3090:2
 # export SLURM_CONF=/home/sladmitet/slurm/slurm.conf
 # squeue -w tikgpu10 -O jobid,username,state,timeused,numcpus,gres:50,reasonlist -S +i

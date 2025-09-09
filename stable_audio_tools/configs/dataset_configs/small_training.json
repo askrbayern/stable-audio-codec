@@ -1,0 +1,17 @@
+{
+  "dataset_type": "audio_dir",
+  "random_crop": true,
+  "drop_last": true,
+  "balanced_domains": true,
+  "domains": ["music", "speech", "env"],
+  "ensure_full_band_per_batch": true,
+  "volume_norm": false,
+  "volume_norm_param": [-24, 0],
+  "datasets": [
+    { "id": "musdb",   "path": "/itet-stor/feigao/net_scratch/datasets/musdb/musdb18hq/train",               "domain": "music", "assume_full_band": true },
+
+    { "id": "daps_fullband",    "path": "/itet-stor/feigao/net_scratch/datasets/daps/daps/train_fullband",                      "domain": "speech", "assume_full_band": true },
+    { "id": "daps_device",    "path": "/itet-stor/feigao/net_scratch/datasets/daps/daps/train_device",                      "domain": "speech", "assume_full_band": false },
+    { "id": "audioset","path": "/itet-stor/feigao/net_scratch/datasets/audioset/hf/extracted/audio/bal_train",     "domain": "env", "assume_full_band": false }
+  ]
+}

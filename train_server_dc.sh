@@ -6,9 +6,9 @@ export LOG_DATASET_TIMINGS=1
 
 set -e
 
-# Usage: train_server_dc.sh <wandb_project> <wandb_run_name> <continue|new>
+# Usage: train_server_dc.sh <wandb_project> <wandb_run_name> <continue|new|dropLM>
 if [ $# -lt 3 ]; then
-  echo "Usage: $0 <wandb_project> <wandb_run_name> <continue|new>"
+  echo "Usage: $0 <wandb_project> <wandb_run_name> <continue|new|dropLM>"
   exit 1
 fi
 
@@ -20,18 +20,22 @@ RECON_DIR=/itet-stor/feigao/net_scratch/datasets/recon
 OUTPUT_DIR=/itet-stor/feigao/net_scratch/outputs/${WANDB_PROJECT}/${WANDB_RUN_NAME}
 
 
-MODEL_CONFIG=/itet-stor/feigao/home/stable-audio-tools/stable_audio_tools/configs/model_configs/test/fsq/size32768/sf128/regularLR/fsq2048_config.json
-# DATA_CONFIG=/itet-stor/feigao/home/stable-audio-tools/stable_audio_tools/configs/dataset_configs/test_training.json
+# MODEL_CONFIG=/itet-stor/feigao/home/stable-audio-tools/stable_audio_tools/configs/model_configs/test/fsq/size16384/sf128/regularLR/fsq128_w0.1_config.json
+# MODEL_CONFIG=/itet-stor/feigao/home/stable-audio-tools/stable_audio_tools/configs/model_configs/test/fsq/size32768/sf128/regularLR/fsq128_w1_config.json
+MODEL_CONFIG=/itet-stor/feigao/home/stable-audio-tools/stable_audio_tools/configs/model_configs/test/fsq/size32768/sf128/regularLR/fsq256_w1_config.json
+# MODEL_CONFIG=/itet-stor/feigao/home/stable-audio-tools/stable_audio_tools/configs/model_configs/test/fsq/size32768/sf512/regularLR/fsq2048_config.json
+# DATA_CONFIG=/itet-stor/feigao/home/stable-audio-tools/stable_audio_tools/configs/dataset_configs/full_training_mixed.json
 # DATA_CONFIG=/itet-stor/feigao/home/stable-audio-tools/stable_audio_tools/configs/dataset_configs/full_training_tikgpu10.json
+# DATA_CONFIG=/itet-stor/feigao/home/stable-audio-tools/stable_audio_tools/configs/dataset_configs/small_training.json
 DATA_CONFIG=/itet-stor/feigao/home/stable-audio-tools/stable_audio_tools/configs/dataset_configs/full_training.json
 CHECKPOINT_PATH=${OUTPUT_DIR}/checkpoints/last.ckpt
 
 BATCH_SIZE=30
 NUM_WORKERS=8
-MAX_EPOCHS=2000
-NUM_GPUS=8
+MAX_EPOCHS=200
+NUM_GPUS=4
 PRECISION="bf16-mixed"
-CKPT_EVERY_EPOCHS=2
+CKPT_EVERY_EPOCHS=10
 RECON_EVERY_EPOCHS=5
 
 
@@ -84,7 +88,29 @@ elif [ "$RESUME_MODE" = "new" ]; then
     --precision "$PRECISION" \
     --checkpoint-every-epochs $CKPT_EVERY_EPOCHS \
     --recon-every-epochs $RECON_EVERY_EPOCHS
+elif [ "$RESUME_MODE" = "dropLM" ]; then
+  if [ ! -f "$CHECKPOINT_PATH" ]; then
+    echo "Checkpoint not found at $CHECKPOINT_PATH. Cannot dropLM."
+    exit 1
+  fi
+  python train_start_dc.py \
+    --model-config "$MODEL_CONFIG" \
+    --data-config "$DATA_CONFIG" \
+    --recon-dir "$RECON_DIR" \
+    --output-dir "$OUTPUT_DIR" \
+    --batch-size $BATCH_SIZE \
+    --num-workers $NUM_WORKERS \
+    --max-epochs $MAX_EPOCHS \
+    --wandb-project "$WANDB_PROJECT" \
+    --wandb-run-name "$WANDB_RUN_NAME" \
+    --accelerator gpu \
+    --devices $NUM_GPUS \
+    --precision "$PRECISION" \
+    --checkpoint-every-epochs $CKPT_EVERY_EPOCHS \
+    --recon-every-epochs $RECON_EVERY_EPOCHS \
+    --ckpt-path "$CHECKPOINT_PATH" \
+    --drop-lm
 else
-  echo "Unknown mode: $RESUME_MODE (use 'continue' or 'new')"
+  echo "Unknown mode: $RESUME_MODE (use 'continue', 'new', or 'dropLM')"
   exit 1
 fi

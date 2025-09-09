@@ -5,9 +5,9 @@
 #SBATCH --error=/itet-stor/feigao/net_scratch/logs/rsync_audio_%j.err
 #SBATCH --nodelist=tikgpu10
 #SBATCH --gres=gpu:0
-#SBATCH --cpus-per-task=6
+#SBATCH --cpus-per-task=2
 #SBATCH --mem=16G
-#SBATCH --time=12:00:00
+#SBATCH --time=48:00:00
 
 set -euo pipefail
 

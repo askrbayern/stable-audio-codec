@@ -1,0 +1,23 @@
+{
+  "dataset_type": "audio_dir",
+  "random_crop": true,
+  "drop_last": true,
+  "balanced_domains": true,
+  "domains": ["music", "speech", "env"],
+  "ensure_full_band_per_batch": true,
+  "volume_norm": false,
+  "volume_norm_param": [-24, 0],
+  "datasets": [
+    { "id": "jamendo", "path": "/scratch/feigao/datasets/dataset/jamendo/raw_30s", "domain": "music", "assume_full_band": true },
+    { "id": "musdb",   "path": "/scratch/feigao/datasets/dataset/musdb",               "domain": "music", "assume_full_band": true },
+
+    { "id": "daps_fullband",    "path": "/scratch/feigao/datasets/dataset/daps/train_fullband",                      "domain": "speech", "assume_full_band": true },
+    { "id": "daps_device",    "path": "/scratch/feigao/datasets/dataset/daps/train_device",                      "domain": "speech", "assume_full_band": false },
+    { "id": "dns4",    "path": "/itet-stor/feigao/net_scratch/datasets/dns_challenge_4/clean_fullband/extracted",     "domain": "speech", "assume_full_band": true },
+    { "id": "cv",      "path": "/scratch/feigao/datasets/dataset/common_voice/en/clips",              "domain": "speech", "assume_full_band": false },
+    { "id": "vctk",      "path": "/scratch/feigao/datasets/dataset/vctk",              "domain": "speech", "assume_full_band": true },
+
+    { "id": "audioset","path": "/scratch/feigao/datasets/dataset/audioset/bal_train",     "domain": "env", "assume_full_band": false },
+    { "id": "audioset","path": "/scratch/feigao/datasets/dataset/audioset/unbal_train",     "domain": "env", "assume_full_band": false }
+  ]
+}
